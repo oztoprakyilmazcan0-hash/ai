@@ -953,7 +953,7 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   }
   client.print("</script>");
   
-  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
+  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy;</div></div></body></html>");
 }
 
 void handleClient(WiFiClient &client) {
