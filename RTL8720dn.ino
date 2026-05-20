@@ -884,7 +884,7 @@ void sendStartPage(WiFiClient &client) {
     client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;width:auto;box-shadow:none;'>Sil</button>");
     client.print("</form></div></div>");
   }
-  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
+  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy;</div></div></body></html>");
 }
 
 void sendSwitchingPage(WiFiClient &client) {
