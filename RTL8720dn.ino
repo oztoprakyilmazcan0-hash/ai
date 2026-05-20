@@ -309,7 +309,7 @@ bool sta_connected  = false;
 String conn_result  = "";
 
 unsigned long last_scan_ms = 0;
-#define RESCAN_INTERVAL_MS  20000UL
+#define RESCAN_INTERVAL_MS  600000UL
 
 unsigned long last_channel_check_ms = 0;
 #define CHANNEL_CHECK_INTERVAL_MS 5000UL
