@@ -58,6 +58,34 @@ extern "C" {
   int  wifi_connect(char *ssid, rtw_security_t security_type, char *password, int ssid_len, int password_len, int key_id, void *semaphore);
 }
 
+// ── WiFi BB (Baseband) TX Power Register Adresleri ──────────────────────────
+// RTL8720dn binary analizi ile tespit edildi (MOVT 0x40080000 = 695 hit)
+// Kaynak: km0_km4_image2.bin içindeki "Tx power: CCK 1(0xe08)= 0x%x" debug string'i
+#define WIFI_BB_BASE        0x40080000UL
+#define BB_CCK1_PWR_REG     0xE08   // CCK channel 1
+#define BB_CCK2_11_PWR_REG  0x86C   // CCK channel 2-11
+#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18 Mbps
+#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54 Mbps
+#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3 (HT20)
+#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7 (HT20)
+
+// Her 32-bit register: 4 ayrı güç indeksi, her biri 8 bit.
+// 0x3A = 58 decimal — binary'de gözlemlenen en yüksek güvenli indeks.
+// (eFuse kalibrasyonu üzerinden offset olarak uygulanır; 0x3F denemek isterseniz
+//  güç indeksini yükselterek test edebilirsiniz, ancak risk üreticide.)
+#define BB_PWR_MAX_VAL      0x3A3A3A3AUL
+
+static inline void wifiSetMaxBBTxPower(void) {
+  // WiFi on() çağrıldıktan SONRA çalıştır — chip aktif olmalı
+  volatile uint32_t *r;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK1_PWR_REG);     *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK2_11_PWR_REG);  *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_LO_PWR_REG);  *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_HI_PWR_REG);  *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_LO_PWR_REG);   *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HI_PWR_REG);   *r = BB_PWR_MAX_VAL;
+}
+
 #ifndef PACK_STRUCT_FIELD
 #define PACK_STRUCT_FIELD(x) x
 #endif
@@ -1511,6 +1539,11 @@ void setup() {
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   delay(800);
 
+  // ── WiFi BB TX power: AP başladıktan SONRA yaz ──────────────────────────
+  // wifi_start_ap() içinde PHY reinit olabilir — önce değil sonra yazılmalı.
+  // Böylece sahte AP (evil twin dahil) max güçte beacon yayar.
+  wifiSetMaxBBTxPower();
+
   ip4_addr_t ip, mask, gw;
   IP4_ADDR(&ip,   192, 168, 4, 1);
   IP4_ADDR(&mask, 255, 255, 255, 0);
@@ -1554,6 +1587,7 @@ void loop() {
     delay(400);
 
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    wifiSetMaxBBTxPower(); // evil twin AP max güçte yayın yapsın
 
     delay(700);
 
@@ -1615,6 +1649,7 @@ void loop() {
     delay(150);
 
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    wifiSetMaxBBTxPower(); // evil twin AP max güçte yayın yapsın
 
     delay(1200);
     netif_set_up(&xnetif[1]);
