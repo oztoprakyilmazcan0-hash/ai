@@ -281,8 +281,8 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define EXTRA_BURST_COUNT_2G        1
 #define EXTRA_BURST_COUNT_5G        2
 #define EXTRA_BURST_DELAY_MS        10
-#define DEAUTH_FRAME_INTER_DELAY_MS 0   // Frame arası bekleme kaldırıldı — SKB backoff yeterli
-#define DEAUTH_SKB_BACKOFF_MS       5   // SKB hata recovery: 20ms→5ms
+#define DEAUTH_FRAME_INTER_DELAY_MS 3
+#define DEAUTH_SKB_BACKOFF_MS       20
 
 // ═══════════════════════ SCAN PARAMETRELERI (FIX) ═════════════════════════════
 #define SCAN_TIMEOUT_MS             15000   // Scan için timeout
@@ -1587,7 +1587,6 @@ void loop() {
     delay(400);
 
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
-    wifiSetMaxBBTxPower(); // evil twin AP max güçte yayın yapsın
 
     delay(700);
 
@@ -1606,6 +1605,8 @@ void loop() {
 
     dnsServer.begin();
     delay(150);
+
+    wifiSetMaxBBTxPower();
 
     uint8_t new_bssid[6];
     memset(new_bssid, 0, 6);
@@ -1649,7 +1650,6 @@ void loop() {
     delay(150);
 
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
-    wifiSetMaxBBTxPower(); // evil twin AP max güçte yayın yapsın
 
     delay(1200);
     netif_set_up(&xnetif[1]);
@@ -1662,6 +1662,7 @@ void loop() {
     delay(700);
 
     dnsServer.begin();
+    wifiSetMaxBBTxPower();
     ap_running_channel = target_channel;
 
     delay(1000);
