@@ -59,29 +59,44 @@ extern "C" {
 }
 
 // ── WiFi BB (Baseband) TX Power Register Adresleri ──────────────────────────
-// RTL8720dn binary analizi ile tespit edildi (MOVT 0x40080000 = 695 hit)
-// Kaynak: km0_km4_image2.bin içindeki "Tx power: CCK 1(0xe08)= 0x%x" debug string'i
+// Tüm adresler km0_km4_image2.bin binary analizi ile DOĞRULANDI:
+//
+//   Yöntem 1 — Debug string'leri (0x0a8e84):
+//     "CCK 1(0xe08)= 0x%x"        → 0xE08
+//     "CCK 11~2(0x86c)= 0x%x"     → 0x86C
+//     "OFDM 18~6(0xe00)= 0x%x"    → 0xE00
+//     "OFDM 54~24(0xe04)= 0x%x"   → 0xE04
+//     "MCS 3~0(0xe10)= 0x%x"      → 0xE10
+//     "MCS 7~4(0xe14)= 0x%x"      → 0xE14
+//
+//   Yöntem 2 — 32-bit adres tabloları (0x1b188 ve 0x1ba30):
+//     0x40080E08: 7 hit | 0x4008086C: 7 hit | 0x40080E00: 7 hit
+//     0x40080E04: 8 hit | 0x40080E10: 7 hit | 0x40080E14: 6 hit
+//     0x40080E18: 4 hit | 0x40080E1C: 2 hit
+//
+//   VHT (0xE20-0xE4C): binary'de 0 hit — bu firmware'de BB VHT reg. YOK.
+//   0xE0C: binary'de 0 hit — power register değil.
+//   0x7F max: 0xFF bazı Realtek PHY'lerinde signed -1 yorumlanır → güç düşer.
 #define WIFI_BB_BASE        0x40080000UL
-// ── 2.4GHz ──────────────────────────────────────────────────────────────────
-#define BB_CCK1_PWR_REG     0xE08   // CCK channel 1         (2.4GHz only)
-#define BB_CCK2_11_PWR_REG  0x86C   // CCK channel 2-11      (2.4GHz only)
-// ── 2.4GHz + 5GHz ortak ─────────────────────────────────────────────────────
-#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18 Mbps        (her iki band)
-#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54 Mbps       (her iki band)
-#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3  HT20         (her iki band)
-#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7  HT20         (her iki band)
-// ── 5GHz HT40 (geniş kanal) ─────────────────────────────────────────────────
-#define BB_MCS_HT40_LO_REG  0xE18   // MCS 0~3  HT40         (5GHz geniş kanal)
-#define BB_MCS_HT40_HI_REG  0xE1C   // MCS 4~7  HT40         (5GHz geniş kanal)
+// ── 2.4GHz CCK ──────────────────────────────────────────────────────────────
+#define BB_CCK1_PWR_REG     0xE08   // CCK ch1        — 7 hit binary  + debug str
+#define BB_CCK2_11_PWR_REG  0x86C   // CCK ch2-11     — 7 hit binary  + debug str
+// ── OFDM — 2.4GHz + 5GHz ────────────────────────────────────────────────────
+#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18Mbps  — 7 hit binary  + debug str
+#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54Mbps — 8 hit binary  + debug str
+// ── HT20 MCS — 2.4GHz + 5GHz ────────────────────────────────────────────────
+#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3 HT20   — 7 hit binary  + debug str
+#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7 HT20   — 6 hit binary  + debug str
+// ── HT40 MCS — 5GHz geniş kanal ─────────────────────────────────────────────
+#define BB_MCS_HT40_LO_REG  0xE18   // MCS 0~3 HT40   — 4 hit binary  (adres tablosu)
+#define BB_MCS_HT40_HI_REG  0xE1C   // MCS 4~7 HT40   — 2 hit binary  (adres tablosu)
 
-// Her 32-bit register: 4 ayrı güç indeksi, her biri 8 bit.
-// 0x7F = 127 decimal — 7-bit mutlak maksimum.
-// 0xFF bazı Realtek PHY'lerinde signed -1 yorumlanır ve güç düşer;
-// 0x7F en yüksek pozitif indeks olarak güvenli maksimumu temsil eder.
+// Her 32-bit register: 4 ayrı güç indeksi (8-bit/indeks).
+// 0x7F = 127 — tüm indeksleri pozitif maksimuma ayarlar.
 #define BB_PWR_MAX_VAL      0x7F7F7F7FUL
 
 static inline void wifiSetMaxBBTxPower(void) {
-  // WiFi on() çağrıldıktan SONRA çalıştır — chip aktif olmalı
+  // wifi_on() çağrıldıktan SONRA çalıştır — chip aktif olmalı.
   volatile uint32_t *r;
   // 2.4GHz CCK
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK1_PWR_REG);     *r = BB_PWR_MAX_VAL;
@@ -95,6 +110,10 @@ static inline void wifiSetMaxBBTxPower(void) {
   // HT40 MCS — 5GHz geniş kanal
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_LO_REG);  *r = BB_PWR_MAX_VAL;
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_HI_REG);  *r = BB_PWR_MAX_VAL;
+  // ARM Cortex-M33: volatile write bus transaction'ın donanımda tamamlanmasını
+  // garantilemez. DSB (Data Synchronization Barrier) tüm write'ların peripheral'a
+  // ulaşmasını sağlar — sonraki wifi_disable_powersave() güvenli çalışır.
+  __asm volatile("dsb" ::: "memory");
 }
 
 #ifndef PACK_STRUCT_FIELD
