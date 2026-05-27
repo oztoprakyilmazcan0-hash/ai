@@ -962,6 +962,11 @@ static void bleSetRawAdv(BLEAdvert *pAdv, const uint8_t *rawpkt, uint8_t rawlen)
   pAdv->stopAdv();
   vTaskDelay(pdMS_TO_TICKS(5));
 
+  // ── BLE TX Power: maksimum +8 dBm ───────────────────────────────────────
+  // RTK BLE SDK: GAP_PARAM_ADV_TX_POWER = 0x12, int8_t değer (-20..+8 dBm)
+  int8_t ble_tx_power = 8;
+  le_adv_set_param(0x12, sizeof(ble_tx_power), &ble_tx_power);
+
   // ── Rastgele MAC: her çağrı = farklı cihaz görünümü ─────────────────────
   uint8_t rand_addr[6];
   if (le_gen_rand_addr((T_GAP_RAND_ADDR_TYPE)0, rand_addr) == GAP_CAUSE_SUCCESS) {
@@ -971,9 +976,9 @@ static void bleSetRawAdv(BLEAdvert *pAdv, const uint8_t *rawpkt, uint8_t rawlen)
   }
 
   BLEAdvertData advData;
-  advData.addData(rawpkt, rawlen); // ham AD yapısını olduğu gibi ver
+  advData.addData(rawpkt, rawlen);
 
-  pAdv->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND); // non-connectable: AMEBA_BLE_DEV görünmez
+  pAdv->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
   pAdv->setAdvData(advData);
   pAdv->updateAdvertParams();
   pAdv->startAdv();
