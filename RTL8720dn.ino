@@ -1489,8 +1489,11 @@ static void applyPerformanceSettings(void) {
   wifi_disable_powersave();
   wext_private_command("wlan0", "lps 0", 0);
   wext_private_command("wlan0", "ips 0", 0);
+  wext_private_command("wlan1", "lps 0", 0);
+  wext_private_command("wlan1", "ips 0", 0);
   wext_private_command("wlan0", "adaptivity_en 0", 0);
   wext_private_command("wlan1", "adaptivity_en 0", 0);
+  wext_private_command("wlan1", "bcninterval 50", 0);
 }
 
 void setup() {
