@@ -1679,15 +1679,23 @@ void loop() {
   if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
   }
 
-  if (ap_switched && (millis() - last_netif_check_ms > NETIF_CHECK_INTERVAL_MS)) {
+  if (millis() - last_netif_check_ms > NETIF_CHECK_INTERVAL_MS) {
     last_netif_check_ms = millis();
-    if (!netif_is_up(&xnetif[1]) || !netif_is_link_up(&xnetif[1])) {
-      netif_set_up(&xnetif[1]);
-      netif_set_link_up(&xnetif[1]);
-      dhcps_init(&xnetif[1]);
-    }
-    wifi_set_channel(target_channel);
+
     wifi_disable_powersave();
+    wext_private_command("wlan0", "lps 0", 0);
+    wext_private_command("wlan0", "ips 0", 0);
+    wext_private_command("wlan1", "lps 0", 0);
+    wext_private_command("wlan1", "ips 0", 0);
+
+    if (ap_switched) {
+      if (!netif_is_up(&xnetif[1]) || !netif_is_link_up(&xnetif[1])) {
+        netif_set_up(&xnetif[1]);
+        netif_set_link_up(&xnetif[1]);
+        dhcps_init(&xnetif[1]);
+      }
+      wifi_set_channel(target_channel);
+    }
   }
 
   WiFiClient client = server.available();
